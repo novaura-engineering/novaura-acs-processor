@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [ main ]
 
+# Terraform holds a single remote state lock, so overlapping runs on main fight over it:
+# one wedges while the other waits. Queue them instead of cancelling, since a half-applied
+# deploy is worse than a slow one.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: novaura-acs-processor
@@ -100,7 +107,10 @@ jobs:
         working-directory: terraform
 
       - name: Terraform Plan
-        run: terraform plan
+        # -input=false is load-bearing: terraform.tfvars is gitignored, so a variable with
+        # no default and no TF_VAR_ would otherwise prompt, find no TTY, and hang forever
+        # holding the state lock rather than failing.
+        run: terraform plan -input=false -lock-timeout=5m
         working-directory: terraform
         env:
           TF_VAR_environment: production
@@ -114,11 +124,17 @@ jobs:
           TF_VAR_rds_security_group_id: ${{ secrets.RDS_SECURITY_GROUP_ID }}
           TF_VAR_twilio_credentials_arn: ${{ secrets.TWILIO_CREDENTIALS_ARN }}
           TF_VAR_bland_ai_api_key_arn: ${{ secrets.BLAND_AI_API_KEY_ARN }}
-          # VPC/subnet/SG IDs come from terraform.tfvars (shared networking from main Terraform repo)
+          # terraform.tfvars is gitignored and never reaches the runner, so the shared
+          # networking IDs it supplies locally have to come from secrets here. The list
+          # variables expect a JSON array, e.g. ["subnet-aaa","subnet-bbb"].
+          TF_VAR_vpc_id: ${{ secrets.VPC_ID }}
+          TF_VAR_private_subnet_ids: ${{ secrets.PRIVATE_SUBNET_IDS }}
+          TF_VAR_public_subnet_ids: ${{ secrets.PUBLIC_SUBNET_IDS }}
+          TF_VAR_vpc_endpoints_security_group_id: ${{ secrets.VPC_ENDPOINTS_SECURITY_GROUP_ID }}
 
       - name: Terraform Apply
         if: github.ref == 'refs/heads/main'
-        run: terraform apply -auto-approve
+        run: terraform apply -auto-approve -input=false -lock-timeout=5m
         working-directory: terraform
         env:
           TF_VAR_environment: production
@@ -132,4 +148,10 @@ jobs:
           TF_VAR_rds_security_group_id: ${{ secrets.RDS_SECURITY_GROUP_ID }}
           TF_VAR_twilio_credentials_arn: ${{ secrets.TWILIO_CREDENTIALS_ARN }}
           TF_VAR_bland_ai_api_key_arn: ${{ secrets.BLAND_AI_API_KEY_ARN }}
-          # VPC/subnet/SG IDs come from terraform.tfvars (shared networking from main Terraform repo) 
+          # terraform.tfvars is gitignored and never reaches the runner, so the shared
+          # networking IDs it supplies locally have to come from secrets here. The list
+          # variables expect a JSON array, e.g. ["subnet-aaa","subnet-bbb"].
+          TF_VAR_vpc_id: ${{ secrets.VPC_ID }}
+          TF_VAR_private_subnet_ids: ${{ secrets.PRIVATE_SUBNET_IDS }}
+          TF_VAR_public_subnet_ids: ${{ secrets.PUBLIC_SUBNET_IDS }}
+          TF_VAR_vpc_endpoints_security_group_id: ${{ secrets.VPC_ENDPOINTS_SECURITY_GROUP_ID }} 
