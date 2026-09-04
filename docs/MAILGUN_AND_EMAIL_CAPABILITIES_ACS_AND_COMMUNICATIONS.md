@@ -23,7 +23,7 @@ This document summarizes how **Mailgun** and **Postmark** are integrated for out
 ### 2.1 Data model: `ContactEndpointEmailSettings`
 
 - **One-to-one** with `ContactEndpoint` (`related_name='email_settings'`).
-- **`provider`:** `mailgun` and `postmark` are implemented outbound providers (Resend / Mailchimp variants exist in model choices with varying completeness).
+- **`provider`:** `mailgun`, `postmark` and `mailchimp_transactional` are implemented outbound providers. `resend` and `mailchimp_marketing` exist in model choices without a send adapter — **Mailchimp Marketing is audience/campaign-grain and cannot do the per-recipient sends this pipeline is built on**, so use `mailchimp_transactional` to send through a Mailchimp account.
 - **`config` (JSON, non-secret):** For Mailgun, validated keys include:
   - **`domain`** — sending domain (also overridable via secret `domain`).
   - **`eu_region`** (boolean) — selects EU vs US Mailgun API base (`api.eu.mailgun.net` vs `api.mailgun.net`).
@@ -61,6 +61,21 @@ Public helper: **`load_credentials_for_email_settings`** (used by webhooks and d
 - **Plain `TextBody`:** When no non-empty plain body is supplied (`text_body` is `None` or explicit `""`), the final HTML is converted with the same `html_to_plain_text` helper used by Mailgun.
 - **Retries:** transient `requests.Timeout`, `requests.ConnectionError`, HTTP **5xx**, and **429** are retried with bounded exponential backoff and jitter; other **4xx** errors fail immediately.
 - **Webhooks:** Postmark webhook verification and event normalization are not implemented in this ACS processor. Add Postmark webhook ingestion in `novaura_crm_backend/communication_processor/views/` alongside the existing Mailgun webhook path.
+
+### 2.2b `MailchimpTransactionalEmailAdapter` (`shared_services/email/mailchimp_transactional.py`)
+
+Mailchimp Transactional is Mandrill; it is a **separate paid add-on** to a Mailchimp plan and uses its own API key, *not* the Marketing API key (a Marketing key carries a datacenter suffix like `-us14` and will not authenticate here).
+
+- **`send`** — `POST https://mandrillapp.com/api/1.0/messages/send.json` with a `key` field and a `message` object (`from_email`, `from_name`, `to[]`, `subject`, `html`, `text`, optional `headers`, `tags`, `subaccount`, `track_opens`, `track_clicks`, `metadata`). Mandrill authenticates via the JSON body, not a header.
+- **From header split:** dispatch passes a combined `"Name <addr@example.com>"`; Mandrill needs the address and display name as separate fields, so the adapter parses them apart (and rejects a header with no `@`).
+- **`reply_to`:** Mandrill has no top-level reply-to — it is set as a `Reply-To` message header, merged with any list-unsubscribe `extra_headers`.
+- **Credentials secret JSON:** include **`api_key`** (also accepts `MANDRILL_API_KEY` / `MAILCHIMP_TRANSACTIONAL_API_KEY`).
+- **`config` (JSON, non-secret):** `subaccount`, `track_opens` (bool), `track_clicks` (bool), `metadata` (object).
+- **Tags:** Mandrill reserves tags beginning with `_`; those are dropped, each tag is truncated to 50 chars, and at most 10 are sent.
+- **Per-recipient failures are the important difference from other providers.** Mandrill returns **HTTP 200** with an array of per-recipient results whose `status` is one of `sent`, `queued`, `scheduled`, `rejected`, `invalid`. A `rejected` / `invalid` entry is a **failed send inside a success response** — the adapter raises **`MandrillSendRejected`** (carrying `status` and `reject_reason`, e.g. `hard-bounce`, `unsub`, `spam`, `invalid-sender`, `test-mode-limit`, `rule`) so callers get the same failure signal other providers give via HTTP.
+- **Retries:** transient `requests.Timeout`, `ConnectionError`, HTTP 5xx and 429 are retried with bounded exponential backoff and jitter. Mandrill returned **HTTP 500 for invalid API keys until Feb 2023** (401 since), so the retry loop matches on the error `name` (`Invalid_Key`, `PaymentRequired`, `ValidationError`, …) and does **not** retry a named permanent error even when it arrives as a 5xx.
+- **`message_stream`:** no Mandrill equivalent; the CRM adapter accepts and ignores the argument.
+- **Webhooks:** not implemented (same position as Postmark). Mandrill event/inbound ingestion would go in `novaura_crm_backend/communication_processor/views/` alongside the Mailgun webhook path.
 
 ### 2.3 Dispatch services (`shared_services/email/email_dispatch.py`)
 
