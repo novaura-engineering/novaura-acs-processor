@@ -68,7 +68,7 @@ def test_send_message_defers_when_cap_blocks(mock_claim, _elp, _btc, _rmfp):
 
     update_calls: list[tuple] = []
 
-    def update_status(new_status, metadata=None):
+    def update_status(new_status, metadata=None, error_message=None):
         update_calls.append((new_status, metadata))
 
     message = SimpleNamespace(
@@ -112,11 +112,15 @@ class _RetryMessageStub:
         self.status = 'retry'
         self.retry_count = 3
         self.next_eligible_at = timezone.now() + timedelta(hours=1)
+        self.metadata: dict = {}
+        self.error_message = None
         self.status_updates: list[tuple] = []
 
-    def update_status(self, new_status, metadata=None):
+    def update_status(self, new_status, metadata=None, error_message=None):
         self.status_updates.append((new_status, metadata))
         self.status = new_status
+        if error_message is not None:
+            self.error_message = error_message or None
 
 
 def _run_retry_sweep(proc, message):
@@ -160,7 +164,12 @@ def test_failed_retry_at_max_retries_is_marked_failed_final():
          patch.object(proc, '_handle_failed_message_retry', return_value=False):
         _run_retry_sweep(proc, message)
 
-    assert message.status_updates == [('failed_final', {'error': 'Max retries exceeded'})]
+    assert len(message.status_updates) == 1
+    status, meta = message.status_updates[0]
+    assert status == 'failed_final'
+    # the reason a human reads must say how it died, not just "failed to send"
+    assert 'Max retries exceeded after 3 failed send attempts' in meta['error']
+    assert message.error_message == meta['error']
 
 
 @pytest.mark.django_db

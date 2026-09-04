@@ -644,8 +644,20 @@ class BulkCampaignMessage(models.Model):
         self.clean()
         super().save(*args, **kwargs)
 
-    def update_status(self, new_status, metadata=None):
-        """Update message status and related timestamps"""
+    # Statuses that mean nothing is wrong right now, so a stale error_message from an
+    # earlier attempt must not survive into them.
+    NON_ERROR_STATUSES = frozenset(
+        {'pending', 'scheduled', 'sent', 'delivered', 'opened', 'clicked', 'replied'}
+    )
+
+    def update_status(self, new_status, metadata=None, error_message=None):
+        """Update message status, timestamps, and the human-readable reason.
+
+        error_message is what anyone looking at a stuck message reads first, so it has to
+        carry the actual reason. It used to be left at a generic "Message failed to send"
+        while the real cause sat in metadata, which is how four months of messages dropped
+        by a send cap looked like a provider outage.
+        """
         self.status = new_status
         now = timezone.now()
 
@@ -668,6 +680,11 @@ class BulkCampaignMessage(models.Model):
             if not self.metadata:
                 self.metadata = {}
             self.metadata.update(metadata)
+
+        if error_message is not None:
+            self.error_message = error_message or None
+        elif new_status in self.NON_ERROR_STATUSES:
+            self.error_message = None
 
         self.save()
 

@@ -369,7 +369,7 @@ class BulkCampaignProcessor:
                         self.message_group.update_group_status(
                             message.message_group,
                             'failed',
-                            'Message failed to send'
+                            f'Message {related_message.id} failed to send'
                         )
                         related_messages.update(
                             status='failed',
@@ -467,7 +467,15 @@ class BulkCampaignProcessor:
                         logger.info(f"Retry message {message.id} marked for next retry attempt")
                     else:
                         logger.info(f"Retry message {message.id} max retries exceeded, marking as failed_final")
-                        message.update_status('failed_final', {'error': 'Max retries exceeded'})
+                        last_error = (message.metadata or {}).get('last_send_error')
+                        reason = f'Max retries exceeded after {message.retry_count} failed send attempts'
+                        if last_error:
+                            reason = f'{reason}; last error: {last_error}'
+                        message.update_status(
+                            'failed_final',
+                            {'error': reason},
+                            error_message=reason,
+                        )
 
             except Exception as e:
                 logger.exception(f"Error processing retry message {message.id}: {e}")
@@ -1248,6 +1256,13 @@ class BulkCampaignProcessor:
                     message.deferral_reason = f'cap:{claim.blocking_cap_period}:{claim.blocking_cap_id}'
                 else:
                     message.deferral_reason = ''
+                deferral_note = (
+                    f'Waiting on {claim.blocking_cap_period} send cap '
+                    f'(cap {claim.blocking_cap_id}); eligible again '
+                    f'{claim.next_reset_at.isoformat() if claim.next_reset_at else "unknown"}'
+                    if claim.blocking_cap_id is not None
+                    else 'Waiting on send cap'
+                )
                 message.update_status(
                     'scheduled',
                     {
@@ -1255,8 +1270,12 @@ class BulkCampaignProcessor:
                             'cap_id': claim.blocking_cap_id,
                             'period': claim.blocking_cap_period,
                             'next_reset_at': claim.next_reset_at.isoformat() if claim.next_reset_at else None,
+                            'note': deferral_note,
                         },
                     },
+                    # Not an error: 'scheduled' would clear this anyway, but say so
+                    # explicitly since the note is the useful bit.
+                    error_message='',
                 )
                 logger.info(
                     'send_cap_deferred bulk_campaign_message_id=%s campaign_id=%s cap_id=%s period=%s next_reset_at=%s',
@@ -1351,6 +1370,13 @@ class BulkCampaignProcessor:
 
             # Message failed to send
             logger.warning(f"Failed to send message {message.id} (retry attempt: {message.retry_count})")
+            # MessageDeliveryService.send_message returns only (success, thread_message),
+            # so the provider's reason is not available here -- record what is known so a
+            # later failed_final can quote something more useful than a generic string.
+            message.update_status(
+                message.status,
+                {'last_send_error': f'{campaign.channel} delivery reported failure'},
+            )
             if claim and claim.bucket_ids and should_refund_after_send_failure(success, thread_message):
                 refund_send_slot(claim=claim)
                 logger.info(
@@ -1374,7 +1400,11 @@ class BulkCampaignProcessor:
                 except Exception:
                     logger.exception('send_cap_refund_after_exception_failed bulk_campaign_message_id=%s', message.id)
             logger.exception(f"Error sending message {message.id}: {e}")
-            message.update_status('failed', {'error': str(e)})
+            message.update_status(
+                'failed',
+                {'error': str(e), 'last_send_error': str(e)},
+                error_message=str(e),
+            )
             return SendOutcome.FAILED
 
     def _get_next_send_time(self, schedule):
