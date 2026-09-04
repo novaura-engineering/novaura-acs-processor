@@ -591,6 +591,54 @@ class ContactEndpointEmailSettings(models.Model):
             raise ValidationError({'config': str(e)}) from e
 
 
+class EmailConsent(models.Model):
+    """Account-scoped consent state for an email address (mirror of the CRM table).
+
+    Managed in novaura_crm_rest (communications/models/email_consent.py); read here so the
+    dispatch layer can refuse a send to an address that has withdrawn consent. Absence of a
+    row means "no signal, mailable".
+    """
+
+    STATE_SUBSCRIBED = 'subscribed'
+    STATE_UNSUBSCRIBED = 'unsubscribed'
+    STATE_CLEANED = 'cleaned'
+    STATE_COMPLAINED = 'complained'
+
+    STATE_CHOICES = (
+        (STATE_SUBSCRIBED, 'Subscribed'),
+        (STATE_UNSUBSCRIBED, 'Unsubscribed'),
+        (STATE_CLEANED, 'Cleaned (hard bounce or repeated failure)'),
+        (STATE_COMPLAINED, 'Complained (marked as spam)'),
+    )
+
+    # Every state other than subscribed suppresses sending.
+    SENDABLE_STATES = frozenset({STATE_SUBSCRIBED})
+
+    account = models.ForeignKey(
+        Account,
+        on_delete=models.CASCADE,
+        related_name='email_consents',
+    )
+    email_normalized = models.CharField(max_length=254)
+    state = models.CharField(max_length=16, choices=STATE_CHOICES)
+    source = models.CharField(max_length=32)
+    source_detail = models.CharField(max_length=255, blank=True, default='')
+    occurred_at = models.DateTimeField()
+    recorded_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        managed = False
+        db_table = 'email_consent'
+
+    def __str__(self):
+        return f'{self.email_normalized} = {self.state} (account {self.account_id})'
+
+    @property
+    def is_suppressed(self) -> bool:
+        return self.state not in self.SENDABLE_STATES
+
+
 class ContactEndpointCampaign(models.Model):
     """
     Mapping model to handle many-to-many relationship between ContactEndpoint and Campaign.

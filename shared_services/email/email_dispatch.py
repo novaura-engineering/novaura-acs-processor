@@ -12,6 +12,7 @@ from django.core.exceptions import ObjectDoesNotExist
 
 from shared_services.email.base import EmailSendResult
 from shared_services.email.mailgun import list_unsubscribe_extra_headers
+from shared_services.email.email_consent import assert_email_sendable
 from shared_services.email.registry import get_email_provider_adapter
 from shared_services.email.secrets_loader import get_secret_json
 from shared_services.eav_email_merge import (
@@ -71,6 +72,10 @@ def send_from_contact_endpoint(
 ) -> EmailSendResult:
     if not endpoint.channels.filter(channel='email').exists():
         raise ValueError('Contact endpoint does not include the email channel')
+
+    # Consent is checked before credentials are loaded so a suppressed recipient never
+    # reaches a provider. Raises EmailSuppressed, which callers treat as a skip.
+    assert_email_sendable(endpoint.account_id, to_email)
 
     try:
         email_settings = endpoint.email_settings
