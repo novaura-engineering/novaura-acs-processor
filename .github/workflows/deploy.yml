@@ -83,6 +83,24 @@ jobs:
     needs: build-and-push
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
+    env:
+      TF_VAR_environment: production
+      TF_VAR_image_tag: ${{ github.sha }}
+      TF_VAR_db_name: ${{ secrets.DB_NAME }}
+      TF_VAR_db_user: ${{ secrets.DB_USER }}
+      TF_VAR_db_host: ${{ secrets.DB_HOST }}
+      TF_VAR_db_password_arn: ${{ secrets.DB_PASSWORD_ARN }}
+      TF_VAR_django_secret_key_arn: ${{ secrets.DJANGO_SECRET_KEY_ARN }}
+      TF_VAR_rds_security_group_id: ${{ secrets.RDS_SECURITY_GROUP_ID }}
+      TF_VAR_twilio_credentials_arn: ${{ secrets.TWILIO_CREDENTIALS_ARN }}
+      TF_VAR_bland_ai_api_key_arn: ${{ secrets.BLAND_AI_API_KEY_ARN }}
+      # terraform.tfvars is gitignored and never reaches the runner, so the shared
+      # networking IDs it supplies locally have to come from secrets here. The list
+      # variables expect a JSON array, e.g. ["subnet-aaa","subnet-bbb"].
+      TF_VAR_vpc_id: ${{ secrets.VPC_ID }}
+      TF_VAR_private_subnet_ids: ${{ secrets.PRIVATE_SUBNET_IDS }}
+      TF_VAR_public_subnet_ids: ${{ secrets.PUBLIC_SUBNET_IDS }}
+      TF_VAR_vpc_endpoints_security_group_id: ${{ secrets.VPC_ENDPOINTS_SECURITY_GROUP_ID }}
     steps:
       - uses: actions/checkout@v3
       
@@ -97,6 +115,35 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
           
+      - name: Check required Terraform variables are set
+        # An unset GitHub secret arrives as an empty string. Terraform rejects that for a
+        # list variable but accepts it for a string one, so a missing VPC_ID would plan
+        # against vpc_id = "" instead of failing -- and vpc_id decides which VPC the ECS
+        # security group lives in. Fail loudly here instead.
+        run: |
+          missing=()
+          for name in TF_VAR_db_name TF_VAR_db_user TF_VAR_db_host \
+                      TF_VAR_db_password_arn TF_VAR_django_secret_key_arn \
+                      TF_VAR_rds_security_group_id TF_VAR_twilio_credentials_arn \
+                      TF_VAR_bland_ai_api_key_arn TF_VAR_vpc_id \
+                      TF_VAR_private_subnet_ids TF_VAR_public_subnet_ids \
+                      TF_VAR_vpc_endpoints_security_group_id; do
+            if [ -z "${!name}" ]; then
+              missing+=("${name#TF_VAR_}")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "ERROR: these Terraform variables are empty, which means the matching" >&2
+            echo "repository secret is missing or blank:" >&2
+            printf '  %s\n' "${missing[@]}" >&2
+            echo >&2
+            echo "Their values live in terraform/terraform.tfvars, which is gitignored." >&2
+            echo "private_subnet_ids and public_subnet_ids must be JSON arrays," >&2
+            echo '  e.g. ["subnet-aaa","subnet-bbb"]' >&2
+            exit 1
+          fi
+          echo "All required Terraform variables are set."
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -110,48 +157,14 @@ jobs:
         # -input=false is load-bearing: terraform.tfvars is gitignored, so a variable with
         # no default and no TF_VAR_ would otherwise prompt, find no TTY, and hang forever
         # holding the state lock rather than failing.
-        run: terraform plan -input=false -lock-timeout=5m
+        # -out saves the plan so apply runs exactly these changes; a bare `terraform apply`
+        # re-plans, and can act on something the plan step never showed.
+        run: terraform plan -input=false -lock-timeout=5m -out=tfplan
         working-directory: terraform
         env:
-          TF_VAR_environment: production
           TF_VAR_ecr_repository_url: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
-          TF_VAR_image_tag: ${{ github.sha }}
-          TF_VAR_db_name: ${{ secrets.DB_NAME }}
-          TF_VAR_db_user: ${{ secrets.DB_USER }}
-          TF_VAR_db_host: ${{ secrets.DB_HOST }}
-          TF_VAR_db_password_arn: ${{ secrets.DB_PASSWORD_ARN }}
-          TF_VAR_django_secret_key_arn: ${{ secrets.DJANGO_SECRET_KEY_ARN }}
-          TF_VAR_rds_security_group_id: ${{ secrets.RDS_SECURITY_GROUP_ID }}
-          TF_VAR_twilio_credentials_arn: ${{ secrets.TWILIO_CREDENTIALS_ARN }}
-          TF_VAR_bland_ai_api_key_arn: ${{ secrets.BLAND_AI_API_KEY_ARN }}
-          # terraform.tfvars is gitignored and never reaches the runner, so the shared
-          # networking IDs it supplies locally have to come from secrets here. The list
-          # variables expect a JSON array, e.g. ["subnet-aaa","subnet-bbb"].
-          TF_VAR_vpc_id: ${{ secrets.VPC_ID }}
-          TF_VAR_private_subnet_ids: ${{ secrets.PRIVATE_SUBNET_IDS }}
-          TF_VAR_public_subnet_ids: ${{ secrets.PUBLIC_SUBNET_IDS }}
-          TF_VAR_vpc_endpoints_security_group_id: ${{ secrets.VPC_ENDPOINTS_SECURITY_GROUP_ID }}
 
       - name: Terraform Apply
         if: github.ref == 'refs/heads/main'
-        run: terraform apply -auto-approve -input=false -lock-timeout=5m
-        working-directory: terraform
-        env:
-          TF_VAR_environment: production
-          TF_VAR_ecr_repository_url: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
-          TF_VAR_image_tag: ${{ github.sha }}
-          TF_VAR_db_name: ${{ secrets.DB_NAME }}
-          TF_VAR_db_user: ${{ secrets.DB_USER }}
-          TF_VAR_db_host: ${{ secrets.DB_HOST }}
-          TF_VAR_db_password_arn: ${{ secrets.DB_PASSWORD_ARN }}
-          TF_VAR_django_secret_key_arn: ${{ secrets.DJANGO_SECRET_KEY_ARN }}
-          TF_VAR_rds_security_group_id: ${{ secrets.RDS_SECURITY_GROUP_ID }}
-          TF_VAR_twilio_credentials_arn: ${{ secrets.TWILIO_CREDENTIALS_ARN }}
-          TF_VAR_bland_ai_api_key_arn: ${{ secrets.BLAND_AI_API_KEY_ARN }}
-          # terraform.tfvars is gitignored and never reaches the runner, so the shared
-          # networking IDs it supplies locally have to come from secrets here. The list
-          # variables expect a JSON array, e.g. ["subnet-aaa","subnet-bbb"].
-          TF_VAR_vpc_id: ${{ secrets.VPC_ID }}
-          TF_VAR_private_subnet_ids: ${{ secrets.PRIVATE_SUBNET_IDS }}
-          TF_VAR_public_subnet_ids: ${{ secrets.PUBLIC_SUBNET_IDS }}
-          TF_VAR_vpc_endpoints_security_group_id: ${{ secrets.VPC_ENDPOINTS_SECURITY_GROUP_ID }} 
+        run: terraform apply -input=false -lock-timeout=5m tfplan
+        working-directory: terraform 
