@@ -9,7 +9,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 from django.utils import timezone
 
-from bulkcampaign_processor.services.bulk_campaign_processor import BulkCampaignProcessor
+from bulkcampaign_processor.services.bulk_campaign_processor import (
+    BulkCampaignProcessor,
+    SendOutcome,
+)
 from bulkcampaign_processor.services.send_cap_service import ClaimResult
 
 
@@ -65,7 +68,7 @@ def test_send_message_defers_when_cap_blocks(mock_claim, _elp, _btc, _rmfp):
 
     update_calls: list[tuple] = []
 
-    def update_status(new_status, metadata=None):
+    def update_status(new_status, metadata=None, error_message=None):
         update_calls.append((new_status, metadata))
 
     message = SimpleNamespace(
@@ -93,7 +96,103 @@ def test_send_message_defers_when_cap_blocks(mock_claim, _elp, _btc, _rmfp):
     proc.message_delivery = mock_delivery
     out = proc._send_message(message)
 
-    assert out is False
+    assert out is SendOutcome.DEFERRED
     mock_delivery.send_message.assert_not_called()
     assert update_calls and update_calls[0][0] == 'scheduled'
     assert message.deferral_reason == 'cap:hourly:3'
+
+
+class _RetryMessageStub:
+    """Minimal BulkCampaignMessage stand-in for process_retry_messages tests."""
+
+    def __init__(self, message_id=500):
+        self.id = message_id
+        self.campaign = MagicMock()
+        self.campaign.is_active_or_scheduled.return_value = True
+        self.status = 'retry'
+        self.retry_count = 3
+        self.next_eligible_at = timezone.now() + timedelta(hours=1)
+        self.metadata: dict = {}
+        self.error_message = None
+        self.status_updates: list[tuple] = []
+
+    def update_status(self, new_status, metadata=None, error_message=None):
+        self.status_updates.append((new_status, metadata))
+        self.status = new_status
+        if error_message is not None:
+            self.error_message = error_message or None
+
+
+def _run_retry_sweep(proc, message):
+    """Drive process_retry_messages over exactly one message."""
+    with patch(
+        'bulkcampaign_processor.services.bulk_campaign_processor.BulkCampaignMessage'
+    ) as mock_model:
+        chain = mock_model.objects.filter.return_value.select_related.return_value
+        chain.order_by.return_value = [message]
+        return proc.process_retry_messages()
+
+
+@pytest.mark.django_db
+def test_deferred_retry_does_not_consume_a_retry_or_fail_the_message():
+    """A send-cap deferral is not a delivery failure.
+
+    Three deferrals used to exhaust the retry budget and mark the message failed_final,
+    which is how ~32k drip messages were dropped while only waiting for capacity.
+    """
+    proc = BulkCampaignProcessor()
+    message = _RetryMessageStub()
+
+    with patch.object(proc, '_send_message', return_value=SendOutcome.DEFERRED), \
+         patch.object(proc, '_handle_failed_message_retry') as mock_retry:
+        processed = _run_retry_sweep(proc, message)
+
+    mock_retry.assert_not_called()
+    assert message.status_updates == []
+    assert message.status == 'retry'
+    assert message.retry_count == 3
+    assert processed == 0
+
+
+@pytest.mark.django_db
+def test_failed_retry_at_max_retries_is_marked_failed_final():
+    """A genuine delivery failure still exhausts retries and terminates."""
+    proc = BulkCampaignProcessor()
+    message = _RetryMessageStub()
+
+    with patch.object(proc, '_send_message', return_value=SendOutcome.FAILED), \
+         patch.object(proc, '_handle_failed_message_retry', return_value=False):
+        _run_retry_sweep(proc, message)
+
+    assert len(message.status_updates) == 1
+    status, meta = message.status_updates[0]
+    assert status == 'failed_final'
+    # the reason a human reads must say how it died, not just "failed to send"
+    assert 'Max retries exceeded after 3 failed send attempts' in meta['error']
+    assert message.error_message == meta['error']
+
+
+@pytest.mark.django_db
+def test_failed_retry_below_max_is_scheduled_again():
+    proc = BulkCampaignProcessor()
+    message = _RetryMessageStub()
+
+    with patch.object(proc, '_send_message', return_value=SendOutcome.FAILED), \
+         patch.object(proc, '_handle_failed_message_retry', return_value=True) as mock_retry:
+        _run_retry_sweep(proc, message)
+
+    mock_retry.assert_called_once_with(message)
+    assert message.status_updates == []
+
+
+@pytest.mark.django_db
+def test_sent_retry_counts_as_processed():
+    proc = BulkCampaignProcessor()
+    message = _RetryMessageStub()
+
+    with patch.object(proc, '_send_message', return_value=SendOutcome.SENT), \
+         patch.object(proc, '_handle_failed_message_retry') as mock_retry:
+        processed = _run_retry_sweep(proc, message)
+
+    mock_retry.assert_not_called()
+    assert processed == 1
