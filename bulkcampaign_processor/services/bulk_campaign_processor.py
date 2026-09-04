@@ -4,6 +4,7 @@ from django.db import transaction
 from django.db.models import Q
 from twilio.rest import Client
 import pytz
+from enum import Enum
 from datetime import timedelta
 
 from external_models.models.nurturing_campaigns import (
@@ -50,6 +51,27 @@ from bulkcampaign_processor.services.send_cap_service import (
 from sms_marketing.models import SmsSubscriberCampaignSubscription
 
 logger = logging.getLogger(__name__)
+
+class SendOutcome(Enum):
+    """Why a send attempt ended, so callers can tell "not tried" from "tried and failed".
+
+    _send_message used to return a bare bool, and returned False both for a message that
+    was never attempted (rate limited, outside business hours, campaign paused) and for
+    one that was attempted and failed. process_retry_messages treated every False as a
+    delivery failure and spent one of the message's three retries on it, so three send-cap
+    deferrals were enough to mark a message failed_final -- overwriting the `scheduled`
+    status the deferral had just set, and dropping a message that was only ever waiting
+    for capacity.
+
+    DEFERRED means nothing was sent and nothing failed: leave the message alone and let
+    the normal due/retry sweep pick it up when it is eligible again. Only FAILED should
+    consume a retry.
+    """
+
+    SENT = 'sent'
+    DEFERRED = 'deferred'
+    FAILED = 'failed'
+
 
 class BulkCampaignProcessor:
     """
@@ -330,12 +352,19 @@ class BulkCampaignProcessor:
                 # Process all messages in the group atomically
                 with transaction.atomic():
                     all_success = True
+                    any_failed = False
                     for related_message in related_messages:
-                        if not self._send_message(related_message):
+                        outcome = self._send_message(related_message)
+                        if outcome is not SendOutcome.SENT:
                             all_success = False
+                            # A deferred message has not failed -- it is waiting for
+                            # capacity or for its window. Stop working the group, but do
+                            # not brand it failed, or the next sweep sees a failure that
+                            # never happened.
+                            any_failed = outcome is SendOutcome.FAILED
                             break
 
-                    if not all_success:
+                    if any_failed:
                         # If any message failed, mark the group as failed instead of cancelled
                         self.message_group.update_group_status(
                             message.message_group,
@@ -418,9 +447,20 @@ class BulkCampaignProcessor:
                     continue
 
                 # Attempt to send the retry message
-                if self._send_message(message):
+                outcome = self._send_message(message)
+                if outcome is SendOutcome.SENT:
                     processed_count += 1
                     logger.info(f"Successfully processed retry message {message.id} (attempt {message.retry_count})")
+                elif outcome is SendOutcome.DEFERRED:
+                    # Nothing was attempted, so nothing failed. Spending a retry here is
+                    # what let three send-cap deferrals kill a message that was only ever
+                    # waiting for capacity. Leave it for the next sweep.
+                    logger.info(
+                        'retry message %s deferred, not counting a retry (status=%s next_eligible_at=%s)',
+                        message.id,
+                        message.status,
+                        message.next_eligible_at,
+                    )
                 else:
                     # Message failed again, handle retry logic
                     if self._handle_failed_message_retry(message):
@@ -993,33 +1033,33 @@ class BulkCampaignProcessor:
             # Check if message can be sent (including retry status)
             if not message.can_be_sent() and message.status != 'retry':
                 logger.debug(f"Cannot send message {message.id} - status: {message.status}")
-                return False
+                return SendOutcome.DEFERRED
 
             # For retry messages, check if it's time to retry
             if message.status == 'retry':
                 if message.scheduled_for and message.scheduled_for > timezone.now():
                     logger.debug(f"Retry message {message.id} not yet due - scheduled for {message.scheduled_for}")
-                    return False
+                    return SendOutcome.DEFERRED
 
             # Check if message can be sent
             if not campaign.can_send_message(participant):
                 logger.debug(f"Cannot send message {message.id} - campaign or participant not active")
-                return False
+                return SendOutcome.DEFERRED
 
             # Check business hours and weekend restrictions before sending for all campaign types
             # that have business_hours_only enabled
             if campaign.crm_campaign and hasattr(campaign, 'drip_schedule') and campaign.drip_schedule and campaign.drip_schedule.business_hours_only:
                 if not self.time_calculator.is_within_campaign_operating_hours(timezone.now(), campaign.crm_campaign):
                     logger.debug(f"Cannot send drip message {message.id} - outside campaign operating hours")
-                    return False
+                    return SendOutcome.DEFERRED
             elif campaign.crm_campaign and hasattr(campaign, 'reminder_schedule') and campaign.reminder_schedule and campaign.reminder_schedule.business_hours_only:
                 if not self.time_calculator.is_within_campaign_operating_hours(timezone.now(), campaign.crm_campaign):
                     logger.debug(f"Cannot send reminder message {message.id} - outside campaign operating hours")
-                    return False
+                    return SendOutcome.DEFERRED
             elif campaign.crm_campaign and hasattr(campaign, 'blast_schedule') and campaign.blast_schedule and campaign.blast_schedule.business_hours_only:
                 if not self.time_calculator.is_within_campaign_operating_hours(timezone.now(), campaign.crm_campaign):
                     logger.debug(f"Cannot send blast message {message.id} - outside campaign operating hours")
-                    return False
+                    return SendOutcome.DEFERRED
 
             # For blast: use message.scheduled_for as source of truth (already used for "due" query).
             # Avoids first-send failure when schedule.send_time and message.scheduled_for differ (e.g. timezone).
@@ -1027,7 +1067,7 @@ class BulkCampaignProcessor:
                 now = timezone.now()
                 if now < message.scheduled_for:
                     logger.debug(f"Cannot send blast message {message.id} - scheduled_for {message.scheduled_for} not reached yet")
-                    return False
+                    return SendOutcome.DEFERRED
 
             # Email: replay-safe skip when a worker retries after Mailgun already accepted the send.
             email_send_idempotency_key = None
@@ -1045,7 +1085,7 @@ class BulkCampaignProcessor:
                         email_send_idempotency_key,
                         message.provider_message_id,
                     )
-                    return True
+                    return SendOutcome.SENT
 
             # Get message content (with optional short link and keyword for drip/reminder/blast)
             extra_context = None
@@ -1080,7 +1120,7 @@ class BulkCampaignProcessor:
                         logger.error("Aborting send: failed to publish short link for blast schedule %s", blast_schedule_id)
                     else:
                         logger.error("Aborting send: failed to publish short link for blast message %s", message.id)
-                    return False
+                    return SendOutcome.FAILED
                 resolved_url = build_bulk_short_url(
                     link,
                     drip_step_id=drip_step_id,
@@ -1226,7 +1266,7 @@ class BulkCampaignProcessor:
                     claim.blocking_cap_period,
                     claim.next_reset_at,
                 )
-                return False
+                return SendOutcome.DEFERRED
 
             if claim.claim_token and claim.bucket_ids:
                 message.update_status(
@@ -1307,7 +1347,7 @@ class BulkCampaignProcessor:
                         progress.save()
 
                 logger.info(f"Successfully sent message {message.id} (retry attempt: {message.retry_count})")
-                return True
+                return SendOutcome.SENT
 
             # Message failed to send
             logger.warning(f"Failed to send message {message.id} (retry attempt: {message.retry_count})")
@@ -1319,7 +1359,7 @@ class BulkCampaignProcessor:
                     getattr(claim, 'claim_token', None),
                     list(claim.bucket_ids),
                 )
-            return False
+            return SendOutcome.FAILED
 
         except Exception as e:
             if claim and getattr(claim, 'bucket_ids', ()):
@@ -1335,7 +1375,7 @@ class BulkCampaignProcessor:
                     logger.exception('send_cap_refund_after_exception_failed bulk_campaign_message_id=%s', message.id)
             logger.exception(f"Error sending message {message.id}: {e}")
             message.update_status('failed', {'error': str(e)})
-            return False
+            return SendOutcome.FAILED
 
     def _get_next_send_time(self, schedule):
         """Calculate the next time a message should be sent based on schedule"""
