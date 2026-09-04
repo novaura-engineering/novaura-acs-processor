@@ -1,14 +1,20 @@
 name: Deploy to ECS
 
+# This workflow builds and pushes the image only. Terraform is applied manually from a
+# developer machine via ./terraform-plan.sh and ./terraform-apply.sh, which resolve the
+# image tag from the current commit and refuse to run when no such tag exists in ECR.
+#
+# After merging, pull main before applying so the local commit matches the tag this
+# workflow pushed for the merge commit.
+
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
 
-# Terraform holds a single remote state lock, so overlapping runs on main fight over it:
-# one wedges while the other waits. Queue them instead of cancelling, since a half-applied
-# deploy is worse than a slow one.
+# Queue rather than cancel. A newer push cancelling an in-flight build is how a merged
+# commit ended up with no image in ECR, which then broke a local apply that named its tag.
 concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: false
@@ -77,81 +83,3 @@ jobs:
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-
-  deploy:
-    name: Deploy Infrastructure
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    steps:
-      - uses: actions/checkout@v3
-      
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v1
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
-          
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "1.6.6"
-
-      - name: Terraform Init
-        run: terraform init -reconfigure
-        working-directory: terraform
-
-      - name: Terraform Plan
-        # -input=false is load-bearing: terraform.tfvars is gitignored, so a variable with
-        # no default and no TF_VAR_ would otherwise prompt, find no TTY, and hang forever
-        # holding the state lock rather than failing.
-        run: terraform plan -input=false -lock-timeout=5m
-        working-directory: terraform
-        env:
-          TF_VAR_environment: production
-          TF_VAR_ecr_repository_url: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
-          TF_VAR_image_tag: ${{ github.sha }}
-          TF_VAR_db_name: ${{ secrets.DB_NAME }}
-          TF_VAR_db_user: ${{ secrets.DB_USER }}
-          TF_VAR_db_host: ${{ secrets.DB_HOST }}
-          TF_VAR_db_password_arn: ${{ secrets.DB_PASSWORD_ARN }}
-          TF_VAR_django_secret_key_arn: ${{ secrets.DJANGO_SECRET_KEY_ARN }}
-          TF_VAR_rds_security_group_id: ${{ secrets.RDS_SECURITY_GROUP_ID }}
-          TF_VAR_twilio_credentials_arn: ${{ secrets.TWILIO_CREDENTIALS_ARN }}
-          TF_VAR_bland_ai_api_key_arn: ${{ secrets.BLAND_AI_API_KEY_ARN }}
-          # terraform.tfvars is gitignored and never reaches the runner, so the shared
-          # networking IDs it supplies locally have to come from secrets here. The list
-          # variables expect a JSON array, e.g. ["subnet-aaa","subnet-bbb"].
-          TF_VAR_vpc_id: ${{ secrets.VPC_ID }}
-          TF_VAR_private_subnet_ids: ${{ secrets.PRIVATE_SUBNET_IDS }}
-          TF_VAR_public_subnet_ids: ${{ secrets.PUBLIC_SUBNET_IDS }}
-          TF_VAR_vpc_endpoints_security_group_id: ${{ secrets.VPC_ENDPOINTS_SECURITY_GROUP_ID }}
-
-      - name: Terraform Apply
-        if: github.ref == 'refs/heads/main'
-        run: terraform apply -auto-approve -input=false -lock-timeout=5m
-        working-directory: terraform
-        env:
-          TF_VAR_environment: production
-          TF_VAR_ecr_repository_url: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
-          TF_VAR_image_tag: ${{ github.sha }}
-          TF_VAR_db_name: ${{ secrets.DB_NAME }}
-          TF_VAR_db_user: ${{ secrets.DB_USER }}
-          TF_VAR_db_host: ${{ secrets.DB_HOST }}
-          TF_VAR_db_password_arn: ${{ secrets.DB_PASSWORD_ARN }}
-          TF_VAR_django_secret_key_arn: ${{ secrets.DJANGO_SECRET_KEY_ARN }}
-          TF_VAR_rds_security_group_id: ${{ secrets.RDS_SECURITY_GROUP_ID }}
-          TF_VAR_twilio_credentials_arn: ${{ secrets.TWILIO_CREDENTIALS_ARN }}
-          TF_VAR_bland_ai_api_key_arn: ${{ secrets.BLAND_AI_API_KEY_ARN }}
-          # terraform.tfvars is gitignored and never reaches the runner, so the shared
-          # networking IDs it supplies locally have to come from secrets here. The list
-          # variables expect a JSON array, e.g. ["subnet-aaa","subnet-bbb"].
-          TF_VAR_vpc_id: ${{ secrets.VPC_ID }}
-          TF_VAR_private_subnet_ids: ${{ secrets.PRIVATE_SUBNET_IDS }}
-          TF_VAR_public_subnet_ids: ${{ secrets.PUBLIC_SUBNET_IDS }}
-          TF_VAR_vpc_endpoints_security_group_id: ${{ secrets.VPC_ENDPOINTS_SECURITY_GROUP_ID }} 
