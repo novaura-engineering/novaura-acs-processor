@@ -18,6 +18,14 @@ def validate_email_provider_config(provider, config):
         raw_track_links = cfg.get('track_links')
         if raw_track_links not in (None, '') and raw_track_links not in POSTMARK_TRACK_LINKS_VALUES:
             raise ValueError(f'postmark track_links must be one of {sorted(POSTMARK_TRACK_LINKS_VALUES)}')
+    if provider == 'mailchimp_transactional':
+        subaccount = cfg.get('subaccount')
+        if subaccount is not None and not isinstance(subaccount, str):
+            raise ValueError('mailchimp_transactional "subaccount" must be a string')
+        for key in ('track_opens', 'track_clicks'):
+            val = cfg.get(key)
+            if val is not None and not isinstance(val, bool):
+                raise ValueError(f'mailchimp_transactional "{key}" must be a boolean')
 
 
 class Conversation(models.Model):
@@ -530,8 +538,10 @@ class ContactEndpointEmailSettings(models.Model):
     Email provider configuration for a ContactEndpoint (1:1).
     Non-secret options live in `config`; API keys live in AWS Secrets Manager (ARN on this row).
 
-    Supported providers (see registry): mailgun (implemented), postmark, resend, mailchimp_marketing,
-    mailchimp_transactional (stubs for send until implemented).
+    Supported providers (see registry): mailgun, postmark and mailchimp_transactional are
+    implemented for send. resend and mailchimp_marketing exist in choices but have no send
+    adapter here; mailchimp_marketing is audience/campaign-grain and cannot do the
+    per-recipient sends this pipeline is built on (use mailchimp_transactional instead).
     """
 
     PROVIDER_MAILGUN = 'mailgun'
