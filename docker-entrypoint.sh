@@ -3,16 +3,37 @@ set -e
 
 echo "docker-entrypoint.sh started..."
 
-# Print all environment variables (masking sensitive ones)
+# Print the environment for debugging, hiding values by default.
+#
+# This used to mask only names containing PASSWORD or SECRET, which meant anything
+# named *_TOKEN, *_API_KEY or *_CREDENTIALS was written to CloudWatch in plaintext.
+# The list below is an allowlist, so a newly added variable is hidden until someone
+# decides it is safe to print rather than leaking the first time it ships. Names are
+# always shown, so "is it set?" is still answerable from the logs.
+is_value_safe() {
+    case "$1" in
+        SERVICE_TYPE|DJANGO_SETTINGS_MODULE) return 0 ;;
+        DB_HOST|DB_NAME|DB_USER|DB_PORT) return 0 ;;
+        AWS_REGION|AWS_DEFAULT_REGION) return 0 ;;
+        PATH|PYTHONPATH|PYTHONUNBUFFERED|LANG|HOME|HOSTNAME|PWD|SHLVL) return 0 ;;
+        ECS_CONTAINER_METADATA_URI|ECS_CONTAINER_METADATA_URI_V4|ECS_AGENT_URI) return 0 ;;
+        *_QUEUE_URL) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 echo "Environment variables:"
 echo "====================="
-env | while read -r line; do
-    if [[ $line == *"PASSWORD"* ]] || [[ $line == *"SECRET"* ]]; then
-        echo "${line%%=*}=[MASKED]"
+# Iterate over names rather than parsing `env` output: a value containing a newline
+# would otherwise spill its remaining lines past the mask.
+for _var_name in $(compgen -e | sort); do
+    if is_value_safe "$_var_name"; then
+        printf '%s=%s\n' "$_var_name" "${!_var_name}"
     else
-        echo "$line"
+        printf '%s=[hidden]\n' "$_var_name"
     fi
 done
+unset _var_name
 echo "====================="
 
 # Check if DB_PASSWORD is set
