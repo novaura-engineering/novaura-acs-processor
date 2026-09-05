@@ -34,7 +34,7 @@ import time
 from shared_services.message_delivery import MessageDeliveryService
 from shared_services.nurturing_attribution import resolve_media_campaign_for_participant
 from shared_services.template_variable_render import build_nested_template_context
-from shared_services.message_validation_service import MessageValidationService
+from shared_services.message_validation_service import ValidationOutcome, MessageValidationService
 from shared_services.time_calculation_service import TimeCalculationService
 from shared_services.message_group_service import MessageGroupService
 
@@ -318,7 +318,21 @@ class BulkCampaignProcessor:
                 opt_out_message = related_messages.filter(message_type='opt_out_notice').first()
 
                 # Validate messages before sending
-                if not self.validator.validate_message_pair(regular_message, opt_out_message):
+                outcome = self.validator.validate_message_pair(regular_message, opt_out_message)
+
+                if outcome is ValidationOutcome.NOT_READY:
+                    # A send-cap deferral moves scheduled_for to the next reset, so a
+                    # message selected as due can be not-due by the time it is validated.
+                    # Leave it for the sweep that follows rather than branding the group
+                    # failed, which is how a rate limit used to destroy a message.
+                    logger.info(
+                        'group_not_ready message_group_id=%s bulk_campaign_message_id=%s',
+                        message.message_group_id,
+                        message.id,
+                    )
+                    continue
+
+                if outcome is not ValidationOutcome.VALID:
                     # Update message group status
                     self.message_group.update_group_status(
                         message.message_group,
