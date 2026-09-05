@@ -2,8 +2,26 @@ import logging
 from django.utils import timezone
 from external_models.models.nurturing_campaigns import BulkCampaignMessage
 from shared_services.email.email_dispatch import effective_email_subject
+from enum import Enum
 
 logger = logging.getLogger(__name__)
+
+class ValidationOutcome(Enum):
+    """Why validation stopped, so a caller can tell "not yet" from "malformed".
+
+    validate_message_pair returned a bare bool, and returned False both for a message that
+    is simply not due yet and for one that can never be sent. The caller marked the whole
+    group failed either way -- so a message the send cap had just deferred to the top of
+    the next hour came back as a validation failure, and a normal rate limit destroyed it.
+
+    NOT_READY means nothing is wrong: leave the message alone and let a later sweep take
+    it when it is due.
+    """
+
+    VALID = 'valid'
+    NOT_READY = 'not_ready'
+    INVALID = 'invalid'
+
 
 class MessageValidationService:
     """
@@ -14,7 +32,11 @@ class MessageValidationService:
     def __init__(self, message_delivery_service):
         self.message_delivery_service = message_delivery_service
 
-    def validate_message_pair(self, regular_message: BulkCampaignMessage, opt_out_message: BulkCampaignMessage = None) -> bool:
+    def validate_message_pair(
+        self,
+        regular_message: BulkCampaignMessage,
+        opt_out_message: BulkCampaignMessage = None,
+    ) -> 'ValidationOutcome':
         """
         Validates a pair of messages (regular and opt-out) before sending.
         
@@ -23,7 +45,8 @@ class MessageValidationService:
             opt_out_message: Optional opt-out message to validate
             
         Returns:
-            bool: True if both messages are valid and ready to send
+            ValidationOutcome: VALID to send now, NOT_READY to leave for a later sweep,
+            INVALID when the message cannot be sent as configured.
         """
         try:
             campaign = regular_message.campaign
@@ -33,18 +56,18 @@ class MessageValidationService:
             # Basic campaign and participant validation
             if not campaign.can_send_message(participant):
                 logger.warning(f"Participant {participant.id} not eligible for sending")
-                return False
+                return ValidationOutcome.INVALID
 
             # Validate campaign has proper contact endpoint mappings
             if not self._validate_campaign_contact_endpoints(campaign):
                 logger.warning(f"Campaign {campaign.id} has contact endpoint mapping issues")
-                return False
+                return ValidationOutcome.INVALID
 
             # Validate regular message content
             if campaign.campaign_type == 'reminder':
                 if not regular_message.reminder_message:
                     logger.warning(f"Regular message {regular_message.id} has no reminder_message attached")
-                    return False
+                    return ValidationOutcome.INVALID
                 channel_config = None
                 if campaign.channel == 'sms':
                     channel_config = regular_message.reminder_message.sms_config
@@ -59,30 +82,30 @@ class MessageValidationService:
                 if campaign.channel == 'voice':
                     if not channel_config or not channel_config.platform_config:
                         logger.warning(f"Regular message {regular_message.id} has no platform_config in reminder_message voice config")
-                        return False
+                        return ValidationOutcome.INVALID
                 else:
                     if not channel_config or not channel_config.content:
                         logger.warning(f"Regular message {regular_message.id} has no content in reminder_message channel config")
-                        return False
+                        return ValidationOutcome.INVALID
             else:
                 # For non-reminder campaigns, validate based on channel
                 if campaign.channel == 'voice':
                     # Voice messages need platform configuration
                     if not self._validate_voice_platform_config(regular_message):
                         logger.warning(f"Regular message {regular_message.id} has no valid voice platform configuration")
-                        return False
+                        return ValidationOutcome.INVALID
                 else:
                     # Other channels need content
                     if not regular_message.get_message_content():
                         logger.warning(f"Regular message {regular_message.id} has no content")
-                        return False
+                        return ValidationOutcome.INVALID
 
             # Validate lead contact information
             if campaign.channel in ['sms', 'voice']:
                 formatted_number = self.message_delivery_service._format_phone_number(lead.phone_number)
                 if not formatted_number:
                     logger.warning(f"Lead {lead.id} has invalid phone number")
-                    return False
+                    return ValidationOutcome.INVALID
 
             # Validate opt-out message if present
             if opt_out_message:
@@ -90,31 +113,46 @@ class MessageValidationService:
                     # Voice opt-out messages need platform configuration
                     if not self._validate_voice_platform_config(opt_out_message):
                         logger.warning(f"Opt-out message {opt_out_message.id} has no valid voice platform configuration")
-                        return False
+                        return ValidationOutcome.INVALID
                 else:
                     # Other channels need content
                     if not opt_out_message.get_message_content():
                         logger.warning(f"Opt-out message {opt_out_message.id} has no content")
-                        return False
+                        return ValidationOutcome.INVALID
 
             # Validate message timing
-            if regular_message.scheduled_for > timezone.now():
-                logger.warning(f"Regular message {regular_message.id} is not yet due to be sent")
-                return False
+            # A send-cap deferral rewrites scheduled_for to the next reset, so a message
+            # can legitimately become not-due between selection and validation. That is a
+            # wait, not a defect.
+            if regular_message.scheduled_for and regular_message.scheduled_for > timezone.now():
+                logger.info(
+                    'validation_not_ready bulk_campaign_message_id=%s scheduled_for=%s',
+                    regular_message.id,
+                    regular_message.scheduled_for,
+                )
+                return ValidationOutcome.NOT_READY
 
-            if opt_out_message and opt_out_message.scheduled_for > timezone.now():
-                logger.warning(f"Opt-out message {opt_out_message.id} is not yet due to be sent")
-                return False
+            if (
+                opt_out_message
+                and opt_out_message.scheduled_for
+                and opt_out_message.scheduled_for > timezone.now()
+            ):
+                logger.info(
+                    'validation_not_ready bulk_campaign_message_id=%s scheduled_for=%s',
+                    opt_out_message.id,
+                    opt_out_message.scheduled_for,
+                )
+                return ValidationOutcome.NOT_READY
 
             # Validate channel-specific requirements
             if not self._validate_channel_requirements(campaign, regular_message, opt_out_message):
-                return False
+                return ValidationOutcome.INVALID
 
-            return True
+            return ValidationOutcome.VALID
 
         except Exception as e:
             logger.exception(f"Message validation failed: {e}")
-            return False
+            return ValidationOutcome.INVALID
 
     def _validate_campaign_contact_endpoints(self, campaign) -> bool:
         """
