@@ -69,27 +69,27 @@ def _sent_message(channel='email', message_id=49210, provider_message_id='pm-abc
 
 
 @pytest.mark.django_db
-def test_sent_email_message_reports_sent_not_deferred():
+def test_sent_email_message_reports_already_sent_not_deferred():
     proc = BulkCampaignProcessor()
     proc.message_delivery = MagicMock()
 
     outcome = proc._send_message(_sent_message('email'))
 
-    assert outcome is SendOutcome.SENT, (
+    assert outcome is SendOutcome.ALREADY_SENT, (
         'a DEFERRED here breaks the group loop and strands the scheduled sibling'
     )
     proc.message_delivery.send_message.assert_not_called()
 
 
 @pytest.mark.django_db
-def test_sent_sms_message_reports_sent_not_deferred():
+def test_sent_sms_message_reports_already_sent_not_deferred():
     """154 of the stalled groups were SMS, so the skip cannot be email-only."""
     proc = BulkCampaignProcessor()
     proc.message_delivery = MagicMock()
 
     outcome = proc._send_message(_sent_message('sms'))
 
-    assert outcome is SendOutcome.SENT
+    assert outcome is SendOutcome.ALREADY_SENT
     proc.message_delivery.send_message.assert_not_called()
 
 
@@ -119,13 +119,16 @@ def test_group_loop_reaches_the_scheduled_sibling():
         attempted.append((message.id, message.status, outcome))
         return outcome
 
+    # Both SENT and ALREADY_SENT let the loop continue; only these two do.
+    keeps_going = (SendOutcome.SENT, SendOutcome.ALREADY_SENT)
+
     sent = _sent_message('email', message_id=49210)
     scheduled = _sent_message('email', message_id=49211, provider_message_id='')
     scheduled.status = 'scheduled'
 
     for message in (sent, scheduled):
         outcome = tracking_send(message)
-        if outcome is not SendOutcome.SENT:
+        if outcome not in keeps_going:
             break
 
     assert [a[0] for a in attempted] == [49210, 49211], (

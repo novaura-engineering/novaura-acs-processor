@@ -63,12 +63,18 @@ class SendOutcome(Enum):
     status the deferral had just set, and dropping a message that was only ever waiting
     for capacity.
 
+    ALREADY_SENT means the provider had accepted this message on an earlier pass, so
+    nothing was delivered now. It is deliberately distinct from SENT: the group loop
+    allows one real delivery per sweep, and folding the two together would either let a
+    replay consume that slot -- stalling the group -- or count a skip as a send.
+
     DEFERRED means nothing was sent and nothing failed: leave the message alone and let
     the normal due/retry sweep pick it up when it is eligible again. Only FAILED should
     consume a retry.
     """
 
     SENT = 'sent'
+    ALREADY_SENT = 'already_sent'
     DEFERRED = 'deferred'
     FAILED = 'failed'
 
@@ -365,18 +371,51 @@ class BulkCampaignProcessor:
 
                 # Process all messages in the group atomically
                 with transaction.atomic():
-                    all_success = True
                     any_failed = False
+                    delivered_regular = False
+                    delivered_count = 0
                     for related_message in related_messages:
+                        # At most one regular message per group per sweep.
+                        #
+                        # A group accumulates one message per drip step, so when two steps
+                        # fall overdue together this loop delivered both of them seconds
+                        # apart -- 25 such pairs went out on 4-5 September, one recipient
+                        # receiving steps 142 and 143 within the same second. Spacing is
+                        # meant to come from scheduled_for, and a message that is merely
+                        # late must not lose it. The remaining steps stay untouched and
+                        # the next sweep takes the next one.
+                        #
+                        # The opt-out notice is not rate limited this way: it accompanies
+                        # the regular message it belongs to and is not a separate touch.
+                        if related_message.message_type == 'regular' and delivered_regular:
+                            logger.info(
+                                'group_regular_held_for_next_sweep message_group_id=%s '
+                                'bulk_campaign_message_id=%s',
+                                message.message_group_id,
+                                related_message.id,
+                            )
+                            continue
+
                         outcome = self._send_message(related_message)
-                        if outcome is not SendOutcome.SENT:
-                            all_success = False
-                            # A deferred message has not failed -- it is waiting for
-                            # capacity or for its window. Stop working the group, but do
-                            # not brand it failed, or the next sweep sees a failure that
-                            # never happened.
-                            any_failed = outcome is SendOutcome.FAILED
-                            break
+
+                        if outcome is SendOutcome.SENT:
+                            delivered_count += 1
+                            if related_message.message_type == 'regular':
+                                delivered_regular = True
+                            continue
+
+                        if outcome is SendOutcome.ALREADY_SENT:
+                            # A replay, not a delivery. It must not consume this sweep's
+                            # slot, or a group whose earlier step is already sent would
+                            # never reach the next one.
+                            continue
+
+                        # A deferred message has not failed -- it is waiting for
+                        # capacity or for its window. Stop working the group, but do
+                        # not brand it failed, or the next sweep sees a failure that
+                        # never happened.
+                        any_failed = outcome is SendOutcome.FAILED
+                        break
 
                     if any_failed:
                         # If any message failed, mark the group as failed instead of cancelled
@@ -392,7 +431,10 @@ class BulkCampaignProcessor:
                         )
                         logger.error(f"Failed to send messages in group {message.message_group_id}")
                     else:
-                        processed_count += related_messages.count()
+                        # Deliveries, not group size. This counted every row in the group
+                        # whether or not anything was sent, which is why the worker
+                        # reported "processed 969" while 485 messages sat stuck.
+                        processed_count += delivered_count
 
                 # Mark this message group as processed
                 processed_groups.add(message.message_group_id)
@@ -462,7 +504,10 @@ class BulkCampaignProcessor:
 
                 # Attempt to send the retry message
                 outcome = self._send_message(message)
-                if outcome is SendOutcome.SENT:
+                if outcome in (SendOutcome.SENT, SendOutcome.ALREADY_SENT):
+                    # A replay is not a failure: the provider already has it, so this
+                    # retry is done. Counting it as anything else would spend a retry on
+                    # a message that has in fact been delivered.
                     processed_count += 1
                     logger.info(f"Successfully processed retry message {message.id} (attempt {message.retry_count})")
                 elif outcome is SendOutcome.DEFERRED:
@@ -1077,7 +1122,7 @@ class BulkCampaignProcessor:
                     message.message_group_id,
                     message.provider_message_id,
                 )
-                return SendOutcome.SENT
+                return SendOutcome.ALREADY_SENT
 
             # Carried on the send itself and written back on success, so a replay can be
             # recognised as one. Email-only because only the email path reads it (below).
