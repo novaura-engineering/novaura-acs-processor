@@ -1052,9 +1052,52 @@ class BulkCampaignProcessor:
             campaign = message.campaign
             participant = message.participant
 
+            # Replay-safe skip for a message a provider has already accepted.
+            #
+            # This has to come BEFORE can_be_sent(), which returns False for any status
+            # outside pending/scheduled/retry. An already-sent message was therefore
+            # rejected as DEFERRED before ever reaching this check -- and the caller in
+            # process_due_messages() breaks the group loop on a non-SENT outcome. A group
+            # holding a sent message alongside a scheduled one stalled forever: the sent
+            # one deferred, the loop broke, and the scheduled sibling was never attempted.
+            # 485 due groups were stuck this way, swept 199 times an hour, sending nothing.
+            #
+            # Not email-only. A provider_message_id is written once Twilio or Postmark has
+            # accepted the message, so it is equally proof of delivery on either channel,
+            # and 154 of the affected groups are SMS.
+            message.refresh_from_db()
+            if message.status == 'sent' and (message.provider_message_id or '').strip():
+                logger.info(
+                    'bulk_message_already_sent_skip bulk_campaign_message_id=%s '
+                    'nurturing_campaign_id=%s channel=%s message_group_id=%s '
+                    'provider_message_id=%s',
+                    message.id,
+                    campaign.id,
+                    campaign.channel,
+                    message.message_group_id,
+                    message.provider_message_id,
+                )
+                return SendOutcome.SENT
+
+            # Carried on the send itself and written back on success, so a replay can be
+            # recognised as one. Email-only because only the email path reads it (below).
+            email_send_idempotency_key = None
+            if campaign.channel == 'email':
+                email_send_idempotency_key = (message.metadata or {}).get(
+                    'send_idempotency_key'
+                ) or f'bulk_campaign_message:{message.id}'
+
             # Check if message can be sent (including retry status)
             if not message.can_be_sent() and message.status != 'retry':
-                logger.debug(f"Cannot send message {message.id} - status: {message.status}")
+                # info, not debug: this is the outcome that silently stalls a group, and
+                # the worker runs at INFO, so at debug nobody could see why nothing moved.
+                logger.info(
+                    'bulk_message_not_sendable bulk_campaign_message_id=%s status=%s '
+                    'message_group_id=%s',
+                    message.id,
+                    message.status,
+                    message.message_group_id,
+                )
                 return SendOutcome.DEFERRED
 
             # For retry messages, check if it's time to retry
@@ -1090,24 +1133,6 @@ class BulkCampaignProcessor:
                 if now < message.scheduled_for:
                     logger.debug(f"Cannot send blast message {message.id} - scheduled_for {message.scheduled_for} not reached yet")
                     return SendOutcome.DEFERRED
-
-            # Email: replay-safe skip when a worker retries after Mailgun already accepted the send.
-            email_send_idempotency_key = None
-            if campaign.channel == 'email':
-                message.refresh_from_db()
-                email_send_idempotency_key = (message.metadata or {}).get(
-                    'send_idempotency_key'
-                ) or f'bulk_campaign_message:{message.id}'
-                if message.status == 'sent' and (message.provider_message_id or '').strip():
-                    logger.info(
-                        'bulk_email_idempotent_skip bulk_campaign_message_id=%s '
-                        'nurturing_campaign_id=%s send_idempotency_key=%s provider_message_id=%s',
-                        message.id,
-                        campaign.id,
-                        email_send_idempotency_key,
-                        message.provider_message_id,
-                    )
-                    return SendOutcome.SENT
 
             # Get message content (with optional short link and keyword for drip/reminder/blast)
             extra_context = None
