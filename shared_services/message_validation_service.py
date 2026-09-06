@@ -31,6 +31,10 @@ class MessageValidationService:
 
     def __init__(self, message_delivery_service):
         self.message_delivery_service = message_delivery_service
+        # Endpoints already reported as unverified during this sweep. The service is built
+        # once per process_due_messages() run, so this scopes the warning to one line per
+        # endpoint per sweep instead of one per message -- see _warn_unverified_once.
+        self._unverified_endpoints_warned = set()
 
     def validate_message_pair(
         self,
@@ -354,6 +358,30 @@ class MessageValidationService:
             logger.exception(f"Email validation failed: {e}")
             return False
 
+    def _warn_unverified_once(self, endpoint_value: str) -> None:
+        """Report an unverified endpoint once per sweep rather than once per message.
+
+        ``ContactEndpoint.is_verified`` defaults to False and nothing in either repo ever
+        sets it True -- there is no verification flow, so this branch is taken for every
+        message we validate. At roughly 500 due messages a sweep and a sweep every two
+        minutes that was ~7k log lines an hour, about 92% of this worker's CloudWatch
+        volume, which buries anything that actually matters.
+
+        The warning is kept rather than deleted because the field is still readable and
+        someone may yet build verification behind it. It does not gate sending: Postmark
+        and Mailgun enforce their own sender verification, and that is the check that
+        decides whether mail leaves.
+        """
+        if endpoint_value in self._unverified_endpoints_warned:
+            return
+        self._unverified_endpoints_warned.add(endpoint_value)
+        logger.warning(
+            "Contact endpoint %s is not verified in the CRM (further occurrences this run "
+            "suppressed). This does not block sending; the provider enforces its own "
+            "sender verification.",
+            endpoint_value,
+        )
+
     def _validate_contact_endpoint_mapping(self, campaign, channel, endpoint_value) -> bool:
         """
         Validates that a specific contact endpoint is properly mapped to the campaign.
@@ -388,7 +416,7 @@ class MessageValidationService:
             
             # Check if the contact endpoint is verified (optional but recommended)
             if not contact_endpoint_mapping.contact_endpoint.is_verified:
-                logger.warning(f"Contact endpoint {endpoint_value} is not verified")
+                self._warn_unverified_once(endpoint_value)
                 # You can choose to return False here if you want to require verification
                 # return False
             
