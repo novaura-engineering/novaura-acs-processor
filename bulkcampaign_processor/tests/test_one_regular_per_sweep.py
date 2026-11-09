@@ -72,7 +72,7 @@ def _due_listing(*messages):
 
     def reread(id):
         found = MagicMock()
-        found.select_related.return_value.first.return_value = by_id.get(id)
+        found.exists.return_value = id in by_id
         return found
 
     due_qs.filter.side_effect = reread

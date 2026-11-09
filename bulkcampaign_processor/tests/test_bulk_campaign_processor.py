@@ -123,11 +123,11 @@ class _RetryMessageStub:
             self.error_message = error_message or None
 
 
-def _run_retry_sweep(proc, message):
+def _run_retry_sweep(proc, message, lock_acquired=True):
     """Drive process_retry_messages over exactly one message."""
     with patch(
         'bulkcampaign_processor.services.bulk_campaign_processor.BulkCampaignMessage'
-    ) as mock_model:
+    ) as mock_model, patch.object(proc, '_lock_message_for_send', return_value=lock_acquired):
         chain = mock_model.objects.filter.return_value.select_related.return_value
         chain.order_by.return_value = [message]
         return proc.process_retry_messages()
@@ -196,3 +196,17 @@ def test_sent_retry_counts_as_processed():
 
     mock_retry.assert_not_called()
     assert processed == 1
+
+
+@pytest.mark.django_db
+def test_retry_never_sends_a_message_whose_lock_another_worker_holds():
+    """The retry path takes the due sweep's lock, so the two can never double-send."""
+    proc = BulkCampaignProcessor()
+    message = _RetryMessageStub()
+
+    with patch.object(proc, '_send_message', return_value=SendOutcome.SENT) as send:
+        processed = _run_retry_sweep(proc, message, lock_acquired=False)
+
+    send.assert_not_called()
+    assert processed == 0
+    assert message.status_updates == []

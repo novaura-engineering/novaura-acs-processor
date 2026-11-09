@@ -91,16 +91,12 @@ class _Sweep:
         due_qs = MagicMock()
         due_qs.order_by.return_value.values_list.return_value = list(self.rows)
 
-        def reread(id):
-            self.loaded.append(id)
+        def recheck(id):
             found = MagicMock()
-            row = next(r for r in self.rows if r[0] == id)
-            found.select_related.return_value.first.return_value = (
-                None if id in self.vanished else _message(id, row[1], row[2], row[4])
-            )
+            found.exists.return_value = id not in self.vanished
             return found
 
-        due_qs.filter.side_effect = reread
+        due_qs.filter.side_effect = recheck
 
         def send_and_record(message):
             self.attempted.append(message.id)
@@ -114,10 +110,11 @@ class _Sweep:
                     return len(kwargs['id__in'])
                 qs.update.side_effect = record
                 return qs
-            group = kwargs['message_group']
-            row = next(r for r in self.rows if r[1] == group.id)
+            group_id = kwargs['message_group_id']
+            row = next(r for r in self.rows if r[1] == group_id)
+            self.loaded.append(row[0])
             qs.select_related.return_value.order_by.return_value = _GroupMessages(
-                [_message(row[0], row[1], row[2])]
+                [_message(row[0], row[1], row[2], row[4])]
             )
             return qs
 
@@ -356,17 +353,71 @@ def test_stale_claim_reconcile_reads_only_rows_that_hold_a_claim():
 # --- scheduler -----------------------------------------------------------------------
 
 
+def _drip_tables(cursor):
+    """Just the columns the drip prefilter reads (the real tables are unmanaged)."""
+    cursor.execute(
+        'CREATE TABLE lead_nurturing_participant ('
+        'id INTEGER PRIMARY KEY, nurturing_campaign_id INTEGER, status VARCHAR(20), lead_id INTEGER)'
+    )
+    cursor.execute(
+        'CREATE TABLE drip_campaign_progress ('
+        'id INTEGER PRIMARY KEY, participant_id INTEGER, current_step_id INTEGER)'
+    )
+    cursor.execute(
+        'CREATE TABLE bulk_campaign_message ('
+        'id INTEGER PRIMARY KEY, participant_id INTEGER, campaign_id INTEGER, '
+        'message_type VARCHAR(20), drip_message_step_id INTEGER, status VARCHAR(20))'
+    )
+
+
 @pytest.mark.django_db
-def test_drip_scheduler_leaves_out_participants_with_nothing_to_schedule_in_sql():
-    proc = BulkCampaignProcessor()
+def test_drip_scheduler_keeps_exactly_the_participants_a_pass_could_schedule():
+    """Run the real prefilter against rows, one participant per case."""
+    from django.db import connection
+
     from external_models.models.nurturing_campaigns import LeadNurturingCampaign
 
-    sql = str(proc._drip_participants_to_schedule(LeadNurturingCampaign(id=254)).query).upper()
+    with connection.cursor() as cur:
+        _drip_tables(cur)
+        participants = [
+            # id, campaign, status
+            (1, 254, 'active'),  # no progress yet -> kept (loop creates it)
+            (2, 254, 'active'),  # finished (current_step NULL) -> left out
+            (3, 254, 'active'),  # current step already has a failed_final regular -> left out
+            (4, 254, 'active'),  # current step has no message -> kept
+            (5, 254, 'active'),  # two progress rows -> kept, loop decides
+            (6, 254, 'active'),  # only an opt-out for the step -> kept, as before
+            (7, 254, 'active'),  # regular for the step, but in another campaign -> kept
+            (8, 254, 'opted_out'),  # not active -> left out, as before
+            (9, 253, 'active'),  # other campaign -> left out, as before
+        ]
+        cur.executemany(
+            'INSERT INTO lead_nurturing_participant (id, nurturing_campaign_id, status, lead_id) '
+            'VALUES (%s, %s, %s, 1)',
+            participants,
+        )
+        cur.executemany(
+            'INSERT INTO drip_campaign_progress (participant_id, current_step_id) VALUES (%s, %s)',
+            [(2, None), (3, 42), (4, 43), (5, None), (5, 44), (6, 45), (7, 46)],
+        )
+        cur.executemany(
+            'INSERT INTO bulk_campaign_message '
+            '(participant_id, campaign_id, message_type, drip_message_step_id, status) '
+            'VALUES (%s, %s, %s, %s, %s)',
+            [
+                (3, 254, 'regular', 42, 'failed_final'),
+                (4, 254, 'regular', 41, 'sent'),  # an earlier step, not the current one
+                (6, 254, 'opt_out_notice', 45, 'sent'),
+                (7, 999, 'regular', 46, 'sent'),
+            ],
+        )
 
-    assert 'NOT (EXISTS' in sql or 'NOT EXISTS' in sql
-    assert 'CURRENT_STEP_ID' in sql
-    assert '"BULK_CAMPAIGN_MESSAGE"' in sql
-    assert '"DRIP_CAMPAIGN_PROGRESS"' in sql
+    proc = BulkCampaignProcessor()
+    kept = set(
+        proc._drip_participants_to_schedule(LeadNurturingCampaign(id=254)).values_list('id', flat=True)
+    )
+
+    assert kept == {1, 4, 5, 6, 7}
 
 
 @pytest.mark.django_db
@@ -416,3 +467,41 @@ def test_pass_loop_stop_ends_the_wait_and_reaches_the_pass():
 
     assert passes == 1, 'a stop during the hour-long wait ends the loop at once'
     assert seen == [False]
+
+
+@pytest.mark.django_db
+def test_send_lock_is_the_group_lock_and_the_row_lock_without_a_group():
+    proc = BulkCampaignProcessor()
+    with patch.object(proc, '_lock_group', return_value=True) as group_lock:
+        assert proc._lock_message_for_send(SimpleNamespace(id=1, message_group_id=10)) is True
+    group_lock.assert_called_once_with(10)
+
+    with patch(f'{MODULE}.BulkCampaignMessage') as model, patch.object(proc, '_lock_group') as group_lock:
+        model.objects.select_for_update.return_value.filter.return_value.values_list.return_value = []
+        assert proc._lock_message_for_send(SimpleNamespace(id=1, message_group_id=None)) is False
+    group_lock.assert_not_called()
+    model.objects.select_for_update.assert_called_once_with(skip_locked=True)
+
+
+@pytest.mark.django_db
+def test_one_failing_deferral_chunk_does_not_drop_the_others():
+    from django.db import OperationalError
+
+    proc = BulkCampaignProcessor()
+    reset = timezone.now() + timedelta(hours=2)
+    proc._cap_blocks = {(253, 'regular'): _denied(reset), (254, 'regular'): _denied(reset)}
+    with patch(f'{MODULE}.BulkCampaignMessage') as model:
+        model.objects.filter.return_value.update.side_effect = [OperationalError('lock wait timeout'), 1]
+        proc._apply_cap_deferrals({(253, 'regular'): [1], (254, 'regular'): [2]})
+
+    assert model.objects.filter.return_value.update.call_count == 2
+
+
+@pytest.mark.django_db
+def test_stale_claim_reconcile_is_narrowed_by_the_scheduled_for_index():
+    with patch('bulkcampaign_processor.services.send_cap_service.BulkCampaignMessage') as bm:
+        bm.objects.filter.return_value.__getitem__.return_value = []
+        reconcile_stale_send_cap_claims(max_age_seconds=300)
+
+    kwargs = bm.objects.filter.call_args.kwargs
+    assert kwargs['scheduled_for__lte'] <= timezone.now() - timedelta(seconds=299)

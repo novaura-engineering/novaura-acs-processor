@@ -229,9 +229,15 @@ def reconcile_stale_send_cap_claims(*, max_age_seconds: int | None = None) -> in
     # Only rows that actually carry a claim. Filtering on "has any metadata" matched every
     # cap-deferred message (they all carry metadata['cap_deferral']), so this re-read the
     # same arbitrary 500 of them on each pass and could miss a real stale claim behind them.
+    #
+    # scheduled_for <= cutoff is the indexed narrowing: a claim is only taken for a message
+    # that is already due (_send_message checks scheduled_for first), so a claim older than
+    # the cutoff sits on a row due before it. Without it the JSON test ran over every
+    # pending/scheduled row, future ones included.
     candidates = BulkCampaignMessage.objects.filter(
         status__in=('pending', 'scheduled'),
         provider_message_id__isnull=True,
+        scheduled_for__lte=cutoff,
         metadata__has_key='send_cap_claim',
     )[:500]
 

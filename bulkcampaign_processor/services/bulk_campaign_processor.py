@@ -319,18 +319,29 @@ class BulkCampaignProcessor:
             updated = 0
             for start in range(0, len(message_ids), CAP_DEFERRAL_CHUNK_SIZE):
                 chunk = message_ids[start:start + CAP_DEFERRAL_CHUNK_SIZE]
-                updated += BulkCampaignMessage.objects.filter(
-                    id__in=chunk,
-                    status__in=CAP_SKIPPABLE_STATUSES,
-                    scheduled_for__lte=now,
-                ).update(
-                    status='scheduled',
-                    scheduled_for=claim.next_reset_at,
-                    next_eligible_at=claim.next_reset_at,
-                    deferral_reason=reason,
-                    error_message=None,
-                    updated_at=now,
-                )
+                try:
+                    updated += BulkCampaignMessage.objects.filter(
+                        id__in=chunk,
+                        status__in=CAP_SKIPPABLE_STATUSES,
+                        scheduled_for__lte=now,
+                    ).update(
+                        status='scheduled',
+                        scheduled_for=claim.next_reset_at,
+                        next_eligible_at=claim.next_reset_at,
+                        deferral_reason=reason,
+                        error_message=None,
+                        updated_at=now,
+                    )
+                except Exception:
+                    # A row in the chunk may be locked by another worker mid-send (lock
+                    # wait timeout / deadlock). Leaving these due is harmless -- the next
+                    # pass defers them -- but one bad chunk must not drop the rest.
+                    logger.exception(
+                        'send_cap_deferred_batch_failed campaign_id=%s message_type=%s chunk_size=%s',
+                        campaign_id,
+                        message_type,
+                        len(chunk),
+                    )
             logger.info(
                 'send_cap_deferred_batch campaign_id=%s message_type=%s cap_id=%s period=%s '
                 'next_reset_at=%s count=%s',
@@ -354,6 +365,20 @@ class BulkCampaignProcessor:
         return bool(list(
             BulkCampaignMessageGroup.objects.select_for_update(skip_locked=True)
             .filter(id=group_id)
+            .values_list('id', flat=True)
+        ))
+
+    def _lock_message_for_send(self, message):
+        """Take the lock every bulk send must hold: its group's, or the row's if it has none.
+
+        _send_message re-reads the message and skips one already sent, so any two callers
+        that both hold this lock can never deliver the same message twice.
+        """
+        if message.message_group_id is not None:
+            return self._lock_group(message.message_group_id)
+        return bool(list(
+            BulkCampaignMessage.objects.select_for_update(skip_locked=True)
+            .filter(id=message.id)
             .values_list('id', flat=True)
         ))
 
@@ -455,18 +480,13 @@ class BulkCampaignProcessor:
                     logger.debug('bulk_group_held_by_other_worker message_group_id=%s', group_id)
                     return 0, True, True
 
-                # Re-read under the lock: another worker may have sent or rescheduled it
-                # between the id listing and now.
-                message = (
-                    self._due_messages(timezone.now())
-                    .filter(id=message_id)
-                    .select_related(*MESSAGE_SEND_RELATIONS, 'message_group')
-                    .first()
-                )
-                if message is None:
+                # Re-check under the lock: another worker may have sent or rescheduled it
+                # between the id listing and now. Ids only -- the group's rows, with
+                # their relations, are loaded once below.
+                if not self._due_messages(timezone.now()).filter(id=message_id).exists():
                     return 0, True, False
 
-                delivered, mark_processed = self._process_group_for_message(message)
+                delivered, mark_processed = self._process_group_for_message(message_id, group_id)
                 return delivered, mark_processed, False
 
         except Exception as e:
@@ -488,16 +508,35 @@ class BulkCampaignProcessor:
             )
             return 0, True, False
 
-    def _process_group_for_message(self, message):
+    def _process_group_for_message(self, message_id, group_id):
         """The per-group send logic, for the group's earliest due message.
 
-        Runs inside the group lock taken by _process_due_group.
+        Runs inside the group lock taken by _process_due_group. The group's messages are
+        read once, with every relation a send needs; the due message is taken from them.
+        They used to be re-queried for the due row, the regular, the opt-out and the send
+        loop -- four or five ~20-join reads of the same rows per group.
 
         Returns:
             (delivered, mark_processed): mark_processed is False where the old sweep
             `continue`d without recording the group, so a later due message of the same
             group may still be worked in this pass.
         """
+        # Get all messages in the group (prefetch link-resolution chain so
+        # participant.originating_subscription → opt_in_rule → short_link is available when sending)
+        related_messages = BulkCampaignMessage.objects.filter(
+            message_group_id=group_id
+        ).select_related(
+            *MESSAGE_SEND_RELATIONS, 'message_group'
+        ).order_by(
+            '-message_type',  # Descending order puts 'regular' before 'opt_out_notice'
+            'scheduled_for'  # Then by scheduled time
+        )
+        group_messages = list(related_messages)
+        message = next((m for m in group_messages if m.id == message_id), None)
+        if message is None:
+            # Moved to another group since the listing; the next pass sees it there.
+            return 0, True
+
         # Check if the campaign is still active before processing
         if not message.campaign.is_active_or_scheduled():
             logger.warning(f"Skipping message {message.id} from inactive campaign {message.campaign.id} - Status: {message.campaign.status}")
@@ -514,20 +553,9 @@ class BulkCampaignProcessor:
                 message.update_status('failed_final', {'error': 'Max retries exceeded'})
                 return 0, False
 
-        # Get all messages in the group (prefetch link-resolution chain so
-        # participant.originating_subscription → opt_in_rule → short_link is available when sending)
-        related_messages = BulkCampaignMessage.objects.filter(
-            message_group=message.message_group
-        ).select_related(
-            *MESSAGE_SEND_RELATIONS
-        ).order_by(
-            '-message_type',  # Descending order puts 'regular' before 'opt_out_notice'
-            'scheduled_for'  # Then by scheduled time
-        )
-
         # Get regular and opt-out messages
-        regular_message = related_messages.filter(message_type='regular').first()
-        opt_out_message = related_messages.filter(message_type='opt_out_notice').first()
+        regular_message = next((m for m in group_messages if m.message_type == 'regular'), None)
+        opt_out_message = next((m for m in group_messages if m.message_type == 'opt_out_notice'), None)
 
         # Validate messages before sending
         outcome = self.validator.validate_message_pair(regular_message, opt_out_message)
@@ -582,7 +610,9 @@ class BulkCampaignProcessor:
             any_failed = False
             delivered_regular = False
             delivered_count = 0
-            for related_message in related_messages:
+            # Each send re-reads its row (_send_message refresh_from_db), so the
+            # in-memory status left stale by the reset above does not matter.
+            for related_message in group_messages:
                 # At most one regular message per group per sweep.
                 #
                 # A group accumulates one message per drip step, so when two steps
@@ -687,44 +717,51 @@ class BulkCampaignProcessor:
 
         for message in retry_messages:
             try:
-                # Check if the campaign is still active
-                if not message.campaign.is_active_or_scheduled():
-                    logger.warning(f"Skipping retry message {message.id} from inactive campaign {message.campaign.id}")
-                    continue
+                # Same lock the due sweep takes, so a retry run alongside the worker
+                # can never send a message the worker is sending.
+                with transaction.atomic():
+                    if not self._lock_message_for_send(message):
+                        logger.info('retry_message_held_by_other_worker bulk_campaign_message_id=%s', message.id)
+                        continue
 
-                # Attempt to send the retry message
-                outcome = self._send_message(message)
-                if outcome in (SendOutcome.SENT, SendOutcome.ALREADY_SENT):
-                    # A replay is not a failure: the provider already has it, so this
-                    # retry is done. Counting it as anything else would spend a retry on
-                    # a message that has in fact been delivered.
-                    processed_count += 1
-                    logger.info(f"Successfully processed retry message {message.id} (attempt {message.retry_count})")
-                elif outcome is SendOutcome.DEFERRED:
-                    # Nothing was attempted, so nothing failed. Spending a retry here is
-                    # what let three send-cap deferrals kill a message that was only ever
-                    # waiting for capacity. Leave it for the next sweep.
-                    logger.info(
-                        'retry message %s deferred, not counting a retry (status=%s next_eligible_at=%s)',
-                        message.id,
-                        message.status,
-                        message.next_eligible_at,
-                    )
-                else:
-                    # Message failed again, handle retry logic
-                    if self._handle_failed_message_retry(message):
-                        logger.info(f"Retry message {message.id} marked for next retry attempt")
-                    else:
-                        logger.info(f"Retry message {message.id} max retries exceeded, marking as failed_final")
-                        last_error = (message.metadata or {}).get('last_send_error')
-                        reason = f'Max retries exceeded after {message.retry_count} failed send attempts'
-                        if last_error:
-                            reason = f'{reason}; last error: {last_error}'
-                        message.update_status(
-                            'failed_final',
-                            {'error': reason},
-                            error_message=reason,
+                    # Check if the campaign is still active
+                    if not message.campaign.is_active_or_scheduled():
+                        logger.warning(f"Skipping retry message {message.id} from inactive campaign {message.campaign.id}")
+                        continue
+
+                    # Attempt to send the retry message
+                    outcome = self._send_message(message)
+                    if outcome in (SendOutcome.SENT, SendOutcome.ALREADY_SENT):
+                        # A replay is not a failure: the provider already has it, so this
+                        # retry is done. Counting it as anything else would spend a retry on
+                        # a message that has in fact been delivered.
+                        processed_count += 1
+                        logger.info(f"Successfully processed retry message {message.id} (attempt {message.retry_count})")
+                    elif outcome is SendOutcome.DEFERRED:
+                        # Nothing was attempted, so nothing failed. Spending a retry here is
+                        # what let three send-cap deferrals kill a message that was only ever
+                        # waiting for capacity. Leave it for the next sweep.
+                        logger.info(
+                            'retry message %s deferred, not counting a retry (status=%s next_eligible_at=%s)',
+                            message.id,
+                            message.status,
+                            message.next_eligible_at,
                         )
+                    else:
+                        # Message failed again, handle retry logic
+                        if self._handle_failed_message_retry(message):
+                            logger.info(f"Retry message {message.id} marked for next retry attempt")
+                        else:
+                            logger.info(f"Retry message {message.id} max retries exceeded, marking as failed_final")
+                            last_error = (message.metadata or {}).get('last_send_error')
+                            reason = f'Max retries exceeded after {message.retry_count} failed send attempts'
+                            if last_error:
+                                reason = f'{reason}; last error: {last_error}'
+                            message.update_status(
+                                'failed_final',
+                                {'error': reason},
+                                error_message=reason,
+                            )
 
             except Exception as e:
                 logger.exception(f"Error processing retry message {message.id}: {e}")

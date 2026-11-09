@@ -481,6 +481,13 @@ resource "aws_ecs_service" "bulk_campaign_worker_service" {
   # worker can do. See var.bulk_worker_count.
   desired_count = var.bulk_worker_count
   launch_type   = "FARGATE"
+
+  # Stop old workers before starting new ones. Old task definitions may not take the
+  # group lock -- the first deploy of this change replaces ten unlocked workers -- and an
+  # old and a new worker side by side could both send the same message. A short gap
+  # with no worker only delays sends by a pass.
+  deployment_minimum_healthy_percent = 0
+  deployment_maximum_percent         = 100
   
   network_configuration {
     subnets          = var.public_subnet_ids # Using only the private-nat subnets for outbound internet access
