@@ -62,9 +62,20 @@ variable "journey_worker_count" {
 }
 
 variable "bulk_worker_count" {
-  description = "Number of worker tasks"
+  description = "Number of bulk-campaign worker tasks (process_due_messages --loop). Workers claim message groups with SKIP LOCKED, so >1 is safe, but send caps -- not CPU -- bound throughput; one is enough at current volume."
   type        = number
-  default     = 2
+  default     = 1
+}
+
+variable "bulk_scheduler_count" {
+  description = "Number of bulk-campaign scheduler tasks (process_bulk_campaigns --loop). Keep at 1."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.bulk_scheduler_count <= 1
+    error_message = "Run at most one bulk-campaign scheduler; two would schedule the same participants concurrently."
+  }
 }
 
 variable "communication_worker_count" {

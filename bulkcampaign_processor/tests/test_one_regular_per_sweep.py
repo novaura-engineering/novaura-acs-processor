@@ -62,6 +62,23 @@ class _RelatedQuerySet(list):
         return self
 
 
+def _due_listing(*messages):
+    """The due sweep's queryset: an id listing, then a re-read of one message under lock."""
+    by_id = {m.id: m for m in messages}
+    due_qs = MagicMock()
+    due_qs.order_by.return_value.values_list.return_value = [
+        (m.id, m.message_group_id, m.campaign.id, m.message_type, m.status) for m in messages
+    ]
+
+    def reread(id):
+        found = MagicMock()
+        found.exists.return_value = id in by_id
+        return found
+
+    due_qs.filter.side_effect = reread
+    return due_qs
+
+
 def _run_due_sweep(proc, related_items, outcomes):
     """Drive the real process_due_messages() over exactly one group."""
     related = _RelatedQuerySet(related_items)
@@ -78,13 +95,16 @@ def _run_due_sweep(proc, related_items, outcomes):
     ), patch(
         'bulkcampaign_processor.services.bulk_campaign_processor.BulkCampaignMessage'
     ) as mock_model, patch.object(
+        proc, '_due_messages', return_value=_due_listing(due_entry)
+    ), patch.object(
+        proc, '_lock_group', return_value=True
+    ), patch.object(
         proc, '_send_message', side_effect=fake_send
     ), patch.object(
         proc.validator, 'validate_message_pair', return_value=ValidationOutcome.VALID
     ):
-        chain = mock_model.objects.filter.return_value.select_related.return_value
-        # First order_by() is the due sweep; every later one is the group's messages.
-        chain.order_by.side_effect = [[due_entry]] + [related] * 12
+        # Every query on the model itself is the group's messages.
+        mock_model.objects.filter.return_value.select_related.return_value.order_by.return_value = related
         proc.message_group = MagicMock()
         processed = proc.process_due_messages()
 

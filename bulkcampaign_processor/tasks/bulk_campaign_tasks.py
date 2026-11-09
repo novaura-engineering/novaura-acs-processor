@@ -1,5 +1,4 @@
 import logging
-from django.utils import timezone
 from django.db.models import Q
 
 from external_models.models.nurturing_campaigns import LeadNurturingCampaign
@@ -7,10 +6,16 @@ from bulkcampaign_processor.services.bulk_campaign_processor import BulkCampaign
 
 logger = logging.getLogger(__name__)
 
-def process_bulk_campaigns():
+
+def process_bulk_campaigns(should_stop=None):
     """
-    Process all active bulk campaigns
-    This should be run periodically by a scheduled task
+    Process all active bulk campaigns.
+
+    Run every few minutes: `manage.py process_bulk_campaigns --loop` in production.
+
+    Args:
+        should_stop: optional callable; checked between campaigns so a stopping
+            service finishes the campaign it is on and exits.
     """
     processor = BulkCampaignProcessor()
     processed_count = 0
@@ -24,8 +29,11 @@ def process_bulk_campaigns():
         'reminder_schedule',
         'blast_schedule'
     )
-    
+
     for campaign in campaigns:
+        if should_stop is not None and should_stop():
+            logger.info('process_bulk_campaigns_stopping_early')
+            break
         try:
             count = processor.process_campaign(campaign)
             processed_count += count
@@ -35,14 +43,16 @@ def process_bulk_campaigns():
 
     return processed_count
 
-def process_due_messages():
+
+def process_due_messages(should_stop=None, processor=None):
     """
-    Process all messages that are due to be sent
-    This should be run frequently (e.g., every minute) by a scheduled task
+    Process all messages that are due to be sent.
+
+    Run continuously: `manage.py process_due_messages --loop` in production. Pass the
+    same processor across passes to keep its per-process state (stale-claim throttle).
     """
-    processor = BulkCampaignProcessor()
-    processed_count = processor.process_due_messages()
-    return processed_count
+    processor = processor or BulkCampaignProcessor()
+    return processor.process_due_messages(should_stop=should_stop)
 
 
 def process_retry_messages():
@@ -52,4 +62,4 @@ def process_retry_messages():
     """
     processor = BulkCampaignProcessor()
     processed_count = processor.process_retry_messages()
-    return processed_count 
+    return processed_count

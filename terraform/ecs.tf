@@ -37,7 +37,11 @@ resource "aws_ecs_task_definition" "bulk_campaign_scheduler_task" {
       name      = "bulk-campaign-scheduler"
       image     = "${data.aws_ecr_repository.processor_repository.repository_url}:${var.image_tag}"
       essential = true
-      command   = ["python", "manage.py", "process_bulk_campaigns"]
+      # --loop: one long-lived process, a pass every 5 minutes. As a bare one-shot command
+      # in an always-on service, ECS relaunched it on every exit and it re-scanned every
+      # participant back to back. SIGTERM finishes the current campaign, then exits.
+      command     = ["python", "manage.py", "process_bulk_campaigns", "--loop"]
+      stopTimeout = 120
       
       environment = [
         { name = "SERVICE_TYPE", value = "bulk_campaign_scheduler" },
@@ -214,7 +218,11 @@ resource "aws_ecs_task_definition" "bulk_campaign_worker_task" {
       name      = "bulk-campaign-worker"
       image     = "${data.aws_ecr_repository.processor_repository.repository_url}:${var.image_tag}"
       essential = true
-      command   = ["python", "manage.py", "process_due_messages"]
+      # --loop: one long-lived process, a pass every 30 seconds. As a bare one-shot command
+      # in an always-on service, ECS relaunched it ~300 times an hour and every start
+      # re-read the whole due set. SIGTERM finishes the current group, then exits.
+      command     = ["python", "manage.py", "process_due_messages", "--loop"]
+      stopTimeout = 60
       
       environment = [
         { name = "SERVICE_TYPE", value = "bulk_campaign_worker" },
@@ -408,8 +416,13 @@ resource "aws_ecs_service" "bulk_campaign_scheduler_service" {
   name            = "novaura-acs-bulk-campaign-scheduler"
   cluster         = aws_ecs_cluster.processor_cluster.id
   task_definition = aws_ecs_task_definition.bulk_campaign_scheduler_task.arn
-  desired_count   = var.bulk_worker_count
+  desired_count   = var.bulk_scheduler_count
   launch_type     = "FARGATE"
+
+  # Stop the old scheduler before starting the new one on deploy: two schedulers
+  # walking the same participants at once only race each other.
+  deployment_minimum_healthy_percent = 0
+  deployment_maximum_percent         = 100
   
   network_configuration {
     subnets          = var.private_subnet_ids
@@ -463,8 +476,18 @@ resource "aws_ecs_service" "bulk_campaign_worker_service" {
   name            = "novaura-acs-bulk-campaign-worker"
   cluster         = aws_ecs_cluster.processor_cluster.id
   task_definition = aws_ecs_task_definition.bulk_campaign_worker_task.arn
-  desired_count   = var.bulk_worker_count
-  launch_type     = "FARGATE"
+  # Fixed, not autoscaled: workers claim message groups (SELECT ... FOR UPDATE SKIP
+  # LOCKED), so more than one is safe, but send caps bound throughput far below what one
+  # worker can do. See var.bulk_worker_count.
+  desired_count = var.bulk_worker_count
+  launch_type   = "FARGATE"
+
+  # Stop old workers before starting new ones. Old task definitions may not take the
+  # group lock -- the first deploy of this change replaces ten unlocked workers -- and an
+  # old and a new worker side by side could both send the same message. A short gap
+  # with no worker only delays sends by a pass.
+  deployment_minimum_healthy_percent = 0
+  deployment_maximum_percent         = 100
   
   network_configuration {
     subnets          = var.public_subnet_ids # Using only the private-nat subnets for outbound internet access
