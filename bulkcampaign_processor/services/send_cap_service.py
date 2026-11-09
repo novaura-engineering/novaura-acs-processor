@@ -140,8 +140,13 @@ def try_claim_send_slot(
 
         if blocking:
             transaction.set_rollback(True)
+            # Nothing can go out until EVERY full cap has reset, so defer to the latest
+            # reset, not the earliest. Taking the earliest meant a campaign whose daily cap
+            # was spent deferred its whole backlog to the next hourly reset, where every
+            # message was loaded, denied by the daily cap again, and pushed one more hour:
+            # ~16k GMLR messages re-swept 24 times a day to send nothing.
             blocking.sort(key=lambda item: item[1])
-            cap_block, next_reset_at = blocking[0]
+            cap_block, next_reset_at = blocking[-1]
             return ClaimResult(
                 allowed=False,
                 blocking_cap_id=cap_block.id,
@@ -221,10 +226,14 @@ def reconcile_stale_send_cap_claims(*, max_age_seconds: int | None = None) -> in
         getattr(settings, 'SEND_CAP_CLAIM_STALE_AFTER_SECONDS', 300)
     )
     cutoff = timezone.now() - timedelta(seconds=threshold_s)
+    # Only rows that actually carry a claim. Filtering on "has any metadata" matched every
+    # cap-deferred message (they all carry metadata['cap_deferral']), so this re-read the
+    # same arbitrary 500 of them on each pass and could miss a real stale claim behind them.
     candidates = BulkCampaignMessage.objects.filter(
         status__in=('pending', 'scheduled'),
         provider_message_id__isnull=True,
-    ).exclude(metadata__isnull=True)[:500]
+        metadata__has_key='send_cap_claim',
+    )[:500]
 
     reconciled = 0
     for msg in candidates:

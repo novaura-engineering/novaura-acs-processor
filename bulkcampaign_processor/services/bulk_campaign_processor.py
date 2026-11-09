@@ -1,7 +1,8 @@
 import logging
+from collections import defaultdict
 from django.utils import timezone
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Exists, OuterRef, Q
 from twilio.rest import Client
 import pytz
 from enum import Enum
@@ -10,6 +11,7 @@ from datetime import timedelta
 from external_models.models.nurturing_campaigns import (
     LeadNurturingParticipant,
     BulkCampaignMessage,
+    BulkCampaignMessageGroup,
 )
 
 from external_models.models.drip_campaigns import (
@@ -51,6 +53,38 @@ from bulkcampaign_processor.services.send_cap_service import (
 from sms_marketing.models import SmsSubscriberCampaignSubscription
 
 logger = logging.getLogger(__name__)
+
+# Statuses a message can be in and still be picked up by the due sweep.
+DUE_STATUSES = ('pending', 'scheduled', 'failed', 'retry')
+# Due statuses that go straight to a send attempt (a 'failed' one goes to retry handling
+# first), so a known-full send cap or closed operating window settles them unloaded.
+CAP_SKIPPABLE_STATUSES = ('pending', 'scheduled', 'retry')
+CAP_DEFERRAL_CHUNK_SIZE = 500
+# The stale-claim threshold is minutes (SEND_CAP_CLAIM_STALE_AFTER_SECONDS), so a
+# long-running worker need not re-check on every pass.
+STALE_CLAIM_RECONCILE_INTERVAL_SECONDS = 300
+
+# Everything _send_message reads off a message, loaded in one query per group.
+MESSAGE_SEND_RELATIONS = (
+    'campaign',
+    'campaign__blast_schedule',
+    'campaign__blast_schedule__short_link',
+    'participant',
+    'participant__lead',
+    'participant__nurturing_campaign',
+    'participant__nurturing_campaign__media_campaign',
+    'participant__originating_subscription',
+    'participant__originating_subscription__opt_in_rule',
+    'participant__originating_subscription__opt_in_rule__short_link',
+    'participant__originating_subscription__opt_in_rule__keyword',
+    'participant__originating_subscription__media_campaign',
+    'participant__media_campaign',
+    'campaign__media_campaign',
+    'drip_message_step',
+    'drip_message_step__short_link',
+    'reminder_message',
+    'reminder_message__short_link',
+)
 
 class SendOutcome(Enum):
     """Why a send attempt ended, so callers can tell "not tried" from "tried and failed".
@@ -95,6 +129,11 @@ class BulkCampaignProcessor:
         self.validator = MessageValidationService(self.message_delivery)
         self.time_calculator = TimeCalculationService()
         self.message_group = MessageGroupService()
+        # Per-sweep memo of what is known to block a send, so the rest of a campaign's
+        # due messages need not be loaded only to be turned away the same way.
+        self._cap_blocks = {}
+        self._outside_hours_campaigns = set()
+        self._last_stale_reconcile_at = None
 
     def _keyword_from_rule(self, rule):
         """Get keyword text from SmsKeywordRule (rule.keyword.keyword)."""
@@ -223,14 +262,28 @@ class BulkCampaignProcessor:
             logger.exception(f"Error processing campaign {campaign.id}: {str(e)}")
             return 0
 
-    def process_due_messages(self):
-        """
-        Process all messages that are due to be sent
-        This should be run periodically by a scheduled task
+    def _due_messages(self, now):
+        """Messages due to go out now, from campaigns that may still send."""
+        return BulkCampaignMessage.objects.filter(
+            status__in=DUE_STATUSES,
+            scheduled_for__lte=now,
+            campaign__active=True,
+            campaign__status__in=['active', 'scheduled'],
+        )
 
-        Returns:
-            int: Number of messages processed
+    def _maybe_reconcile_stale_send_cap_claims(self):
+        """Reconcile stuck send-cap claims, at most once per interval per processor.
+
+        A long-running worker calls process_due_messages() every few seconds; the stale
+        threshold is minutes, so reconciling on every pass only re-reads the same rows.
         """
+        now = time.monotonic()
+        if (
+            self._last_stale_reconcile_at is not None
+            and now - self._last_stale_reconcile_at < STALE_CLAIM_RECONCILE_INTERVAL_SECONDS
+        ):
+            return
+        self._last_stale_reconcile_at = now
         try:
             reconciled = reconcile_stale_send_cap_claims()
             if reconciled:
@@ -238,224 +291,361 @@ class BulkCampaignProcessor:
         except Exception:
             logger.exception('reconcile_stale_send_cap_claims failed')
 
-        # Find all pending messages that are due from active campaigns only
-        due_messages = BulkCampaignMessage.objects.filter(
-            status__in=['pending', 'scheduled', 'failed', 'retry'],  # Include retry status for retry functionality
-            scheduled_for__lte=timezone.now(),
-            campaign__active=True,  # Only include messages from active campaigns
-            campaign__status__in=['active', 'scheduled']  # Only include messages from active or scheduled campaigns
-        ).select_related(
-            'campaign',
-            'campaign__blast_schedule',
-            'campaign__blast_schedule__short_link',
-            'participant',
-            'participant__lead',
-            'participant__nurturing_campaign',
-            'participant__nurturing_campaign__media_campaign',
-            'participant__originating_subscription',
-            'participant__originating_subscription__media_campaign',
-            'participant__media_campaign',
-            'campaign__media_campaign',
-            'participant__originating_subscription__opt_in_rule',
-            'participant__originating_subscription__opt_in_rule__short_link',
-            'participant__originating_subscription__opt_in_rule__keyword',
-            'message_group',
-            'drip_message_step',
-            'drip_message_step__short_link',
-            'reminder_message',
-            'reminder_message__short_link',
-        ).order_by('scheduled_for')  # Process messages in order of scheduled time
+    def _cap_block_for(self, campaign_id, message_type, now):
+        """The denied claim still blocking (campaign, message type) this pass, if any."""
+        claim = self._cap_blocks.get((campaign_id, message_type))
+        if claim is None or claim.next_reset_at is None or now >= claim.next_reset_at:
+            return None
+        return claim
+
+    def _apply_cap_deferrals(self, deferred_ids_by_key):
+        """Defer, in bulk, the messages skipped because their send cap is already full.
+
+        Writes what _send_message writes on a denied claim -- status, scheduled_for,
+        next_eligible_at, deferral_reason -- so the CRM sees the same state. The
+        metadata['cap_deferral'] note is not refreshed: it is per-row JSON, and the
+        columns are what the CRM requeue and admin read.
+
+        The status/scheduled_for guard makes this a no-op for a row another worker sent
+        (or rescheduled) while this pass was running.
+        """
+        now = timezone.now()
+        for (campaign_id, message_type), message_ids in deferred_ids_by_key.items():
+            claim = self._cap_blocks[(campaign_id, message_type)]
+            if claim.blocking_cap_id is not None and claim.blocking_cap_period:
+                reason = f'cap:{claim.blocking_cap_period}:{claim.blocking_cap_id}'
+            else:
+                reason = ''
+            updated = 0
+            for start in range(0, len(message_ids), CAP_DEFERRAL_CHUNK_SIZE):
+                chunk = message_ids[start:start + CAP_DEFERRAL_CHUNK_SIZE]
+                updated += BulkCampaignMessage.objects.filter(
+                    id__in=chunk,
+                    status__in=CAP_SKIPPABLE_STATUSES,
+                    scheduled_for__lte=now,
+                ).update(
+                    status='scheduled',
+                    scheduled_for=claim.next_reset_at,
+                    next_eligible_at=claim.next_reset_at,
+                    deferral_reason=reason,
+                    error_message=None,
+                    updated_at=now,
+                )
+            logger.info(
+                'send_cap_deferred_batch campaign_id=%s message_type=%s cap_id=%s period=%s '
+                'next_reset_at=%s count=%s',
+                campaign_id,
+                message_type,
+                claim.blocking_cap_id,
+                claim.blocking_cap_period,
+                claim.next_reset_at,
+                updated,
+            )
+
+    def _lock_group(self, group_id):
+        """Claim a message group for this transaction; False if another worker holds it.
+
+        Every bulk send happens while its group is locked, so two workers can never work
+        the same group at once. Without this, ten workers walked the same due list in the
+        same order: each checked "already sent?", then queued on the send-cap bucket lock,
+        then sent anyway -- one message went to Postmark ten times in three seconds, and
+        the duplicates spent the campaign's daily cap.
+        """
+        return bool(list(
+            BulkCampaignMessageGroup.objects.select_for_update(skip_locked=True)
+            .filter(id=group_id)
+            .values_list('id', flat=True)
+        ))
+
+    def process_due_messages(self, should_stop=None):
+        """
+        Process all messages that are due to be sent.
+
+        The due set is read as ids only; a message's relations are loaded one group at a
+        time, under that group's lock. Loading every due row with its ~20 joined relations
+        on every pass, from every worker, was most of the CRM database's read traffic.
+
+        Messages whose campaign has already hit its send cap this pass, or is outside its
+        operating hours, are not loaded at all: the first one denied is deferred by
+        _send_message as before, and the rest of that campaign's due messages are deferred
+        in bulk to the same reset (cap) or left untouched (hours), exactly as a one-by-one
+        attempt would have left them.
+
+        Args:
+            should_stop: optional callable; when it returns True the sweep stops between
+                groups so a shutting-down worker never abandons a send half-way.
+
+        Returns:
+            int: Number of messages delivered
+        """
+        self._maybe_reconcile_stale_send_cap_claims()
+        self._cap_blocks = {}
+        self._outside_hours_campaigns = set()
+        started = time.monotonic()
+
+        due_rows = list(
+            self._due_messages(timezone.now())
+            .order_by('scheduled_for', 'id')  # Process messages in order of scheduled time
+            .values_list('id', 'message_group_id', 'campaign_id', 'message_type', 'status')
+        )
 
         processed_count = 0
         processed_groups = set()  # Track which message groups we've processed
+        cap_deferred = defaultdict(list)
+        groups_worked = 0
+        groups_held_elsewhere = 0
+        hours_skipped = 0
 
-        for message in due_messages:
-            try:
-                # Skip if we've already processed this message group
-                if message.message_group_id in processed_groups:
+        for message_id, group_id, campaign_id, message_type, status in due_rows:
+            if should_stop is not None and should_stop():
+                logger.info('bulk_due_sweep_stopping_early')
+                break
+
+            # Skip if we've already processed this message group
+            if group_id in processed_groups:
+                continue
+
+            if group_id is None:
+                # Sends are serialised by locking the group; never send without one.
+                logger.warning('bulk_message_without_group_skipped bulk_campaign_message_id=%s', message_id)
+                continue
+
+            if status in CAP_SKIPPABLE_STATUSES:
+                if self._cap_block_for(campaign_id, message_type, timezone.now()) is not None:
+                    cap_deferred[(campaign_id, message_type)].append(message_id)
+                    processed_groups.add(group_id)
+                    continue
+                if campaign_id in self._outside_hours_campaigns:
+                    hours_skipped += 1
+                    processed_groups.add(group_id)
                     continue
 
-                # Check if the campaign is still active before processing
-                if not message.campaign.is_active_or_scheduled():
-                    logger.warning(f"Skipping message {message.id} from inactive campaign {message.campaign.id} - Status: {message.campaign.status}")
-                    continue
+            groups_worked += 1
+            delivered, mark_processed, held = self._process_due_group(message_id, group_id)
+            processed_count += delivered
+            if held:
+                groups_held_elsewhere += 1
+            if mark_processed:
+                processed_groups.add(group_id)
 
-                # Handle retry logic for failed messages
-                if message.status == 'failed':
-                    if self._handle_failed_message_retry(message):
-                        # Message was marked for retry, skip processing for now
-                        continue
-                    else:
-                        # Message cannot be retried; mark as final failure so it is excluded from future runs
-                        logger.info(f"Message {message.id} max retries exceeded, marking as failed_final")
-                        message.update_status('failed_final', {'error': 'Max retries exceeded'})
-                        continue
+        self._apply_cap_deferrals(cap_deferred)
 
-                # Get all messages in the group (prefetch link-resolution chain so
-                # participant.originating_subscription → opt_in_rule → short_link is available when sending)
-                related_messages = BulkCampaignMessage.objects.filter(
-                    message_group=message.message_group
-                ).select_related(
-                    'campaign',
-                    'campaign__blast_schedule',
-                    'campaign__blast_schedule__short_link',
-                    'participant',
-                    'participant__lead',
-                    'participant__nurturing_campaign',
-                    'participant__nurturing_campaign__media_campaign',
-                    'participant__originating_subscription',
-                    'participant__originating_subscription__opt_in_rule',
-                    'participant__originating_subscription__opt_in_rule__short_link',
-                    'participant__originating_subscription__opt_in_rule__keyword',
-                    'participant__originating_subscription__media_campaign',
-                    'participant__media_campaign',
-                    'campaign__media_campaign',
-                    'drip_message_step',
-                    'drip_message_step__short_link',
-                    'reminder_message',
-                    'reminder_message__short_link',
-                ).order_by(
-                    '-message_type',  # Descending order puts 'regular' before 'opt_out_notice'
-                    'scheduled_for'  # Then by scheduled time
+        logger.info(
+            'bulk_due_sweep due=%s groups_worked=%s held_by_other_worker=%s delivered=%s '
+            'cap_deferred=%s outside_hours=%s duration_s=%.1f',
+            len(due_rows),
+            groups_worked,
+            groups_held_elsewhere,
+            processed_count,
+            sum(len(ids) for ids in cap_deferred.values()),
+            hours_skipped,
+            time.monotonic() - started,
+        )
+        return processed_count
+
+    def _process_due_group(self, message_id, group_id):
+        """Work one due message's group under the group's lock.
+
+        Returns:
+            (delivered, mark_processed, held_elsewhere)
+        """
+        try:
+            with transaction.atomic():
+                if not self._lock_group(group_id):
+                    logger.debug('bulk_group_held_by_other_worker message_group_id=%s', group_id)
+                    return 0, True, True
+
+                # Re-read under the lock: another worker may have sent or rescheduled it
+                # between the id listing and now.
+                message = (
+                    self._due_messages(timezone.now())
+                    .filter(id=message_id)
+                    .select_related(*MESSAGE_SEND_RELATIONS, 'message_group')
+                    .first()
                 )
+                if message is None:
+                    return 0, True, False
 
-                # Get regular and opt-out messages
-                regular_message = related_messages.filter(message_type='regular').first()
-                opt_out_message = related_messages.filter(message_type='opt_out_notice').first()
+                delivered, mark_processed = self._process_group_for_message(message)
+                return delivered, mark_processed, False
 
-                # Validate messages before sending
-                outcome = self.validator.validate_message_pair(regular_message, opt_out_message)
-
-                if outcome is ValidationOutcome.NOT_READY:
-                    # A send-cap deferral moves scheduled_for to the next reset, so a
-                    # message selected as due can be not-due by the time it is validated.
-                    # Leave it for the sweep that follows rather than branding the group
-                    # failed, which is how a rate limit used to destroy a message.
-                    logger.info(
-                        'group_not_ready message_group_id=%s bulk_campaign_message_id=%s',
-                        message.message_group_id,
-                        message.id,
-                    )
-                    continue
-
-                if outcome is not ValidationOutcome.VALID:
-                    # Update message group status
-                    self.message_group.update_group_status(
-                        message.message_group,
-                        'failed',
-                        'Message validation failed before sending'
-                    )
-
-                    # Update individual message statuses
-                    related_messages.update(
-                        status='failed',
-                        error_message='Message validation failed before sending',
-                        updated_at=timezone.now()
-                    )
-                    logger.warning(f"Messages in group {message.message_group_id} failed validation")
-                    continue
-
-                # If messages were previously in failed state, update their status
-                if message.message_group.status == 'failed':
-                    self.message_group.update_group_status(
-                        message.message_group,
-                        'pending',
-                        None  # Clear error message
-                    )
-                    related_messages.update(
-                        status='scheduled',
-                        error_message=None,
-                        updated_at=timezone.now()
-                    )
-                    logger.info(f"Retrying messages in group {message.message_group_id} that were previously failed")
-
-                # Process all messages in the group atomically
-                with transaction.atomic():
-                    any_failed = False
-                    delivered_regular = False
-                    delivered_count = 0
-                    for related_message in related_messages:
-                        # At most one regular message per group per sweep.
-                        #
-                        # A group accumulates one message per drip step, so when two steps
-                        # fall overdue together this loop delivered both of them seconds
-                        # apart -- 25 such pairs went out on 4-5 September, one recipient
-                        # receiving steps 142 and 143 within the same second. Spacing is
-                        # meant to come from scheduled_for, and a message that is merely
-                        # late must not lose it. The remaining steps stay untouched and
-                        # the next sweep takes the next one.
-                        #
-                        # The opt-out notice is not rate limited this way: it accompanies
-                        # the regular message it belongs to and is not a separate touch.
-                        if related_message.message_type == 'regular' and delivered_regular:
-                            logger.info(
-                                'group_regular_held_for_next_sweep message_group_id=%s '
-                                'bulk_campaign_message_id=%s',
-                                message.message_group_id,
-                                related_message.id,
-                            )
-                            continue
-
-                        outcome = self._send_message(related_message)
-
-                        if outcome is SendOutcome.SENT:
-                            delivered_count += 1
-                            if related_message.message_type == 'regular':
-                                delivered_regular = True
-                            continue
-
-                        if outcome is SendOutcome.ALREADY_SENT:
-                            # A replay, not a delivery. It must not consume this sweep's
-                            # slot, or a group whose earlier step is already sent would
-                            # never reach the next one.
-                            continue
-
-                        # A deferred message has not failed -- it is waiting for
-                        # capacity or for its window. Stop working the group, but do
-                        # not brand it failed, or the next sweep sees a failure that
-                        # never happened.
-                        any_failed = outcome is SendOutcome.FAILED
-                        break
-
-                    if any_failed:
-                        # If any message failed, mark the group as failed instead of cancelled
-                        self.message_group.update_group_status(
-                            message.message_group,
-                            'failed',
-                            f'Message {related_message.id} failed to send'
-                        )
-                        related_messages.update(
-                            status='failed',
-                            error_message='Message failed to send',
-                            updated_at=timezone.now()
-                        )
-                        logger.error(f"Failed to send messages in group {message.message_group_id}")
-                    else:
-                        # Deliveries, not group size. This counted every row in the group
-                        # whether or not anything was sent, which is why the worker
-                        # reported "processed 969" while 485 messages sat stuck.
-                        processed_count += delivered_count
-
-                # Mark this message group as processed
-                processed_groups.add(message.message_group_id)
-
-            except Exception as e:
-                logger.exception(f"Error processing messages in group {message.message_group_id}: {e}")
-                # Mark the group as failed instead of cancelled
+        except Exception as e:
+            logger.exception(f"Error processing messages in group {group_id}: {e}")
+            # Mark the group as failed instead of cancelled
+            group = BulkCampaignMessageGroup.objects.filter(id=group_id).first()
+            if group is not None:
                 self.message_group.update_group_status(
-                    message.message_group,
+                    group,
                     'failed',
                     f'Error processing messages: {str(e)}'
                 )
-                BulkCampaignMessage.objects.filter(
-                    message_group=message.message_group
-                ).update(
+            BulkCampaignMessage.objects.filter(
+                message_group_id=group_id
+            ).update(
+                status='failed',
+                error_message=f'Error processing messages: {str(e)}',
+                updated_at=timezone.now()
+            )
+            return 0, True, False
+
+    def _process_group_for_message(self, message):
+        """The per-group send logic, for the group's earliest due message.
+
+        Runs inside the group lock taken by _process_due_group.
+
+        Returns:
+            (delivered, mark_processed): mark_processed is False where the old sweep
+            `continue`d without recording the group, so a later due message of the same
+            group may still be worked in this pass.
+        """
+        # Check if the campaign is still active before processing
+        if not message.campaign.is_active_or_scheduled():
+            logger.warning(f"Skipping message {message.id} from inactive campaign {message.campaign.id} - Status: {message.campaign.status}")
+            return 0, False
+
+        # Handle retry logic for failed messages
+        if message.status == 'failed':
+            if self._handle_failed_message_retry(message):
+                # Message was marked for retry, skip processing for now
+                return 0, False
+            else:
+                # Message cannot be retried; mark as final failure so it is excluded from future runs
+                logger.info(f"Message {message.id} max retries exceeded, marking as failed_final")
+                message.update_status('failed_final', {'error': 'Max retries exceeded'})
+                return 0, False
+
+        # Get all messages in the group (prefetch link-resolution chain so
+        # participant.originating_subscription → opt_in_rule → short_link is available when sending)
+        related_messages = BulkCampaignMessage.objects.filter(
+            message_group=message.message_group
+        ).select_related(
+            *MESSAGE_SEND_RELATIONS
+        ).order_by(
+            '-message_type',  # Descending order puts 'regular' before 'opt_out_notice'
+            'scheduled_for'  # Then by scheduled time
+        )
+
+        # Get regular and opt-out messages
+        regular_message = related_messages.filter(message_type='regular').first()
+        opt_out_message = related_messages.filter(message_type='opt_out_notice').first()
+
+        # Validate messages before sending
+        outcome = self.validator.validate_message_pair(regular_message, opt_out_message)
+
+        if outcome is ValidationOutcome.NOT_READY:
+            # A send-cap deferral moves scheduled_for to the next reset, so a
+            # message selected as due can be not-due by the time it is validated.
+            # Leave it for the sweep that follows rather than branding the group
+            # failed, which is how a rate limit used to destroy a message.
+            logger.info(
+                'group_not_ready message_group_id=%s bulk_campaign_message_id=%s',
+                message.message_group_id,
+                message.id,
+            )
+            return 0, False
+
+        if outcome is not ValidationOutcome.VALID:
+            # Update message group status
+            self.message_group.update_group_status(
+                message.message_group,
+                'failed',
+                'Message validation failed before sending'
+            )
+
+            # Update individual message statuses
+            related_messages.update(
+                status='failed',
+                error_message='Message validation failed before sending',
+                updated_at=timezone.now()
+            )
+            logger.warning(f"Messages in group {message.message_group_id} failed validation")
+            return 0, False
+
+        # If messages were previously in failed state, update their status
+        if message.message_group.status == 'failed':
+            self.message_group.update_group_status(
+                message.message_group,
+                'pending',
+                None  # Clear error message
+            )
+            related_messages.update(
+                status='scheduled',
+                error_message=None,
+                updated_at=timezone.now()
+            )
+            logger.info(f"Retrying messages in group {message.message_group_id} that were previously failed")
+
+        delivered_total = 0
+
+        # Process all messages in the group atomically
+        with transaction.atomic():
+            any_failed = False
+            delivered_regular = False
+            delivered_count = 0
+            for related_message in related_messages:
+                # At most one regular message per group per sweep.
+                #
+                # A group accumulates one message per drip step, so when two steps
+                # fall overdue together this loop delivered both of them seconds
+                # apart -- 25 such pairs went out on 4-5 September, one recipient
+                # receiving steps 142 and 143 within the same second. Spacing is
+                # meant to come from scheduled_for, and a message that is merely
+                # late must not lose it. The remaining steps stay untouched and
+                # the next sweep takes the next one.
+                #
+                # The opt-out notice is not rate limited this way: it accompanies
+                # the regular message it belongs to and is not a separate touch.
+                if related_message.message_type == 'regular' and delivered_regular:
+                    logger.info(
+                        'group_regular_held_for_next_sweep message_group_id=%s '
+                        'bulk_campaign_message_id=%s',
+                        message.message_group_id,
+                        related_message.id,
+                    )
+                    continue
+
+                outcome = self._send_message(related_message)
+
+                if outcome is SendOutcome.SENT:
+                    delivered_count += 1
+                    if related_message.message_type == 'regular':
+                        delivered_regular = True
+                    continue
+
+                if outcome is SendOutcome.ALREADY_SENT:
+                    # A replay, not a delivery. It must not consume this sweep's
+                    # slot, or a group whose earlier step is already sent would
+                    # never reach the next one.
+                    continue
+
+                # A deferred message has not failed -- it is waiting for
+                # capacity or for its window. Stop working the group, but do
+                # not brand it failed, or the next sweep sees a failure that
+                # never happened.
+                any_failed = outcome is SendOutcome.FAILED
+                break
+
+            if any_failed:
+                # If any message failed, mark the group as failed instead of cancelled
+                self.message_group.update_group_status(
+                    message.message_group,
+                    'failed',
+                    f'Message {related_message.id} failed to send'
+                )
+                related_messages.update(
                     status='failed',
-                    error_message=f'Error processing messages: {str(e)}',
+                    error_message='Message failed to send',
                     updated_at=timezone.now()
                 )
+                logger.error(f"Failed to send messages in group {message.message_group_id}")
+            else:
+                # Deliveries, not group size. This counted every row in the group
+                # whether or not anything was sent, which is why the worker
+                # reported "processed 969" while 485 messages sat stuck.
+                delivered_total = delivered_count
 
-        return processed_count
+        # Mark this message group as processed
+        return delivered_total, True
 
     def process_retry_messages(self):
         """
@@ -604,10 +794,7 @@ class BulkCampaignProcessor:
         now = timezone.now()
 
         # Find active participants that need messages
-        participants = LeadNurturingParticipant.objects.filter(
-            nurturing_campaign=campaign,
-            status='active'
-        ).select_related('lead')
+        participants = self._drip_participants_to_schedule(campaign)
 
         scheduled_count = 0
 
@@ -645,6 +832,47 @@ class BulkCampaignProcessor:
                 continue
 
         return scheduled_count
+
+    def _drip_participants_to_schedule(self, campaign):
+        """Active participants of a drip campaign that a pass could schedule something for.
+
+        Leaves out, in SQL, the participants the per-participant loop would only turn away:
+          - finished: their single progress row has no current step (`continue`), and
+          - already has a regular message for the current step, in any status:
+            _schedule_drip_message returns False for those (an active one at its first
+            check; any other via create_message_safely's existing-message lookup).
+        GMLR drips 253/254 had ~51k active participants, ~22k of them parked on a
+        failed_final step; checking each one every pass (four-plus queries apiece, plus a
+        progress rewrite) is what kept the scheduler running 20-30 minutes a pass.
+
+        A participant with more than one progress row is never left out: the loop reads
+        `.first()` of them, and this filter does not try to guess which that is.
+        """
+        other_progress = DripCampaignProgress.objects.filter(
+            participant_id=OuterRef('participant_id'),
+        ).exclude(pk=OuterRef('pk'))
+
+        current_step_has_message = BulkCampaignMessage.objects.filter(
+            participant_id=OuterRef('participant_id'),
+            campaign_id=campaign.id,
+            message_type='regular',
+            drip_message_step_id=OuterRef('current_step_id'),
+        )
+
+        nothing_to_schedule = DripCampaignProgress.objects.filter(
+            participant_id=OuterRef('pk'),
+        ).filter(
+            Q(current_step__isnull=True) | Exists(current_step_has_message)
+        ).exclude(
+            Exists(other_progress)
+        )
+
+        return LeadNurturingParticipant.objects.filter(
+            nurturing_campaign=campaign,
+            status='active'
+        ).exclude(
+            Exists(nothing_to_schedule)
+        ).select_related('lead')
 
     def _process_reminder_campaign(self, campaign):
         """Process a reminder campaign"""
@@ -1161,14 +1389,17 @@ class BulkCampaignProcessor:
             if campaign.crm_campaign and hasattr(campaign, 'drip_schedule') and campaign.drip_schedule and campaign.drip_schedule.business_hours_only:
                 if not self.time_calculator.is_within_campaign_operating_hours(timezone.now(), campaign.crm_campaign):
                     logger.debug(f"Cannot send drip message {message.id} - outside campaign operating hours")
+                    self._outside_hours_campaigns.add(campaign.id)
                     return SendOutcome.DEFERRED
             elif campaign.crm_campaign and hasattr(campaign, 'reminder_schedule') and campaign.reminder_schedule and campaign.reminder_schedule.business_hours_only:
                 if not self.time_calculator.is_within_campaign_operating_hours(timezone.now(), campaign.crm_campaign):
                     logger.debug(f"Cannot send reminder message {message.id} - outside campaign operating hours")
+                    self._outside_hours_campaigns.add(campaign.id)
                     return SendOutcome.DEFERRED
             elif campaign.crm_campaign and hasattr(campaign, 'blast_schedule') and campaign.blast_schedule and campaign.blast_schedule.business_hours_only:
                 if not self.time_calculator.is_within_campaign_operating_hours(timezone.now(), campaign.crm_campaign):
                     logger.debug(f"Cannot send blast message {message.id} - outside campaign operating hours")
+                    self._outside_hours_campaigns.add(campaign.id)
                     return SendOutcome.DEFERRED
 
             # For blast: use message.scheduled_for as source of truth (already used for "due" query).
@@ -1334,6 +1565,9 @@ class BulkCampaignProcessor:
                 message_type=message.message_type,
             )
             if not claim.allowed:
+                # Every other due message of this campaign and type would be denied the
+                # same way until the reset; the sweep defers those without loading them.
+                self._cap_blocks[(campaign.id, message.message_type)] = claim
                 message.scheduled_for = claim.next_reset_at
                 message.next_eligible_at = claim.next_reset_at
                 if claim.blocking_cap_id is not None and claim.blocking_cap_period:

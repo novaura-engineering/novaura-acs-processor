@@ -142,9 +142,7 @@ def test_reconcile_stale_send_cap_claims_marks_failed(mock_bm):
     msg.save = MagicMock()
     msg.update_status = MagicMock()
 
-    q1 = MagicMock()
-    q1.exclude.return_value = _Sliced([msg])
-    mock_bm.objects.filter.return_value = q1
+    mock_bm.objects.filter.return_value = _Sliced([msg])
 
     n = reconcile_stale_send_cap_claims(max_age_seconds=60)
     assert n == 1
