@@ -94,13 +94,16 @@ echo "Database is ready!"
 
 # Start the specified service
 case "$SERVICE_TYPE" in
+  # The bulk commands are one-shot unless given --loop. This script, not the ECS task's
+  # `command`, decides what runs (the command is passed as "$@" and ignored), so --loop
+  # has to be here: without it ECS relaunches the process after every pass.
   "bulk_campaign_scheduler")
     echo "Starting bulk campaign processor scheduler..."
-    exec python manage.py process_bulk_campaigns
+    exec python manage.py process_bulk_campaigns --loop
     ;;
   "bulk_campaign_worker")
     echo "Starting bulk campaign processor worker..."
-    exec python manage.py process_due_messages
+    exec python manage.py process_due_messages --loop
     ;;
   "journey_scheduler")
     echo "Starting journey processor scheduler..."
