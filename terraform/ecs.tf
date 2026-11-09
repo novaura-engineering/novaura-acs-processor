@@ -40,6 +40,8 @@ resource "aws_ecs_task_definition" "bulk_campaign_scheduler_task" {
       # --loop: one long-lived process, a pass every 5 minutes. As a bare one-shot command
       # in an always-on service, ECS relaunched it on every exit and it re-scanned every
       # participant back to back. SIGTERM finishes the current campaign, then exits.
+      # Documentation only: docker-entrypoint.sh picks the command from SERVICE_TYPE
+      # and ignores this. Keep the two in step.
       command     = ["python", "manage.py", "process_bulk_campaigns", "--loop"]
       stopTimeout = 120
       
@@ -221,6 +223,8 @@ resource "aws_ecs_task_definition" "bulk_campaign_worker_task" {
       # --loop: one long-lived process, a pass every 30 seconds. As a bare one-shot command
       # in an always-on service, ECS relaunched it ~300 times an hour and every start
       # re-read the whole due set. SIGTERM finishes the current group, then exits.
+      # Documentation only: docker-entrypoint.sh picks the command from SERVICE_TYPE
+      # and ignores this. Keep the two in step.
       command     = ["python", "manage.py", "process_due_messages", "--loop"]
       stopTimeout = 60
       
